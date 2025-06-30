@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
-from torchvision.models import ResNet18_Weights, ResNet34_Weights
+from torchvision.models import ResNet50_Weights
 from kornia.geometry.transform import get_tps_transform, warp_image_tps
 
 
@@ -111,7 +111,7 @@ class CRNN(nn.Module):
         img_height: высота входного изображения
         img_width: максимальная ширина входного изображения
         num_classes: число классов + blank
-        backbone: название CNN-бэкбона ('resnet18')
+        backbone: название CNN-бэкбона ('resnet50')
         pretrained: флаг для ImageNet-весов
         transform: 'none'|'affine'|'tps'
     """
@@ -121,7 +121,7 @@ class CRNN(nn.Module):
         img_height: int,
         img_width: int,
         num_classes: int,
-        backbone: str = "resnet18",
+        backbone: str = "resnet50",
         pretrained: bool = True,
         transform: str = "none",
     ):
@@ -139,9 +139,9 @@ class CRNN(nn.Module):
             self.stn = None
 
         # CNN backbone
-        if backbone == "resnet34":
-            weights = ResNet34_Weights.IMAGENET1K_V1 if pretrained else None
-            cnn = models.resnet34(weights=weights)
+        if backbone == "resnet50":
+            weights = ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
+            cnn = models.resnet50(weights=weights)
             orig = cnn.conv1
             conv1 = nn.Conv2d(
                 1,
@@ -156,7 +156,7 @@ class CRNN(nn.Module):
                     conv1.weight.data = orig.weight.data.sum(dim=1, keepdim=True)
             cnn.conv1 = conv1
             self.cnn = nn.Sequential(*list(cnn.children())[:-2])
-            cnn_out = 512
+            cnn_out = 2048
         else:
             raise ValueError(f"Unsupported backbone: {backbone}")
 
