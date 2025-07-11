@@ -1,10 +1,9 @@
-# train.py
-
 import os
 import csv
 import random
 import warnings
 import textwrap
+from ctc_decoder import CTCDecoder
 
 # suppress TF & oneDNN warnings
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
@@ -20,6 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torch import nn, optim
 from torch.optim import lr_scheduler
 import matplotlib.pyplot as plt
+import torchvision.utils as vutils
 
 from dataset import OCRDataset
 from model import CRNN
@@ -39,7 +39,6 @@ def log_samples(
     for i in range(n):
         img_np = imgs[i].cpu().squeeze(0).numpy()
         axs[i].imshow(img_np, cmap="gray")
-        # обрезаем длинные заголовки
         title = f"GT: {truths[i]} | Pred: {preds[i]}"
         wrapped = "\n".join(textwrap.wrap(title, width=40))
         raw_str = raws[i]
@@ -83,9 +82,14 @@ alphabet = OCRDataset.build_alphabet(
 print(f"Using alphabet ({len(alphabet)}): {alphabet}")
 num_classes = len(alphabet) + 1  # +1 for CTC blank
 
+decoder = CTCDecoder(
+    alphabet=alphabet,
+    use_beam=True,  # 🔁 переключи на False для Greedy
+    kenlm_path="checkpoints/exp_1_archive/3gram.binary",  # или None, если без LM
+)
+
 # 6) Create datasets and dataloaders
 train_datasets, val_datasets = [], []
-
 for csv_path, img_root in zip(train_csvs, train_image_roots):
     train_datasets.append(
         OCRDataset(
@@ -95,10 +99,9 @@ for csv_path, img_root in zip(train_csvs, train_image_roots):
             img_height=img_height,
             img_max_width=img_max_width,
             min_char_freq=1,
-            augment=False,  # аугментации включены в трейне
+            augment=False,
         )
     )
-
 for csv_path, img_root in zip(val_csvs, val_image_roots):
     val_datasets.append(
         OCRDataset(
@@ -108,13 +111,11 @@ for csv_path, img_root in zip(val_csvs, val_image_roots):
             img_height=img_height,
             img_max_width=img_max_width,
             min_char_freq=1,
-            augment=False,  # в валидации без аугментаций
+            augment=False,
         )
     )
-
 train_ds = ConcatDataset(train_datasets)
 val_ds = ConcatDataset(val_datasets)
-
 train_loader = DataLoader(
     train_ds, batch_size=batch_size, shuffle=True, collate_fn=OCRDataset.collate_fn
 )
@@ -131,9 +132,8 @@ model = CRNN(
     num_classes,
     pretrained=False,
     transform="tps",
-    backbone="vgg",  # или "resnet18"
+    backbone="vgg",
 ).to(device)
-
 criterion = nn.CTCLoss(blank=0, zero_infinity=True)
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 scheduler = lr_scheduler.ReduceLROnPlateau(
@@ -143,7 +143,7 @@ scheduler = lr_scheduler.ReduceLROnPlateau(
 # 8) TensorBoard writer
 writer = SummaryWriter(log_dir=log_dir)
 
-# 9) Prepare metrics history CSV and best-metrics TXT
+# 9) Prepare metrics history files
 metrics_csv = os.path.join(checkpoint_dir, "metrics_history.csv")
 with open(metrics_csv, "w", newline="", encoding="utf-8") as f:
     w = csv.writer(f)
@@ -161,15 +161,11 @@ with open(metrics_csv, "w", newline="", encoding="utf-8") as f:
             "lr",
         ]
     )
-
 best_txt = os.path.join(checkpoint_dir, "best_metrics.txt")
 with open(best_txt, "w", encoding="utf-8") as f:
     f.write(f"Experiment: {experiment_name}\n\n")
+best_val_loss, best_val_acc = float("inf"), 0.0
 
-best_val_loss = float("inf")
-best_val_acc = 0.0
-
-# 10) Training loop
 global_step = 0
 for epoch in range(1, epochs + 1):
     # --- Train ---
@@ -179,19 +175,16 @@ for epoch in range(1, epochs + 1):
     for imgs, labs, _, lab_lens in train_loader:
         imgs, labs = imgs.to(device), labs.to(device)
         lab_lens = lab_lens.to(device)
-
         optimizer.zero_grad()
-        out = model(imgs)  # [T, B, C]
+        out = model(imgs)
         Tm, B, _ = out.size()
         inp_lens = torch.full((B,), Tm, dtype=torch.long, device=device)
         loss = criterion(out, labs, inp_lens, lab_lens)
         loss.backward()
         optimizer.step()
-
         writer.add_scalar("train/loss", loss.item(), global_step)
         train_loss += loss.item()
         global_step += 1
-
         preds, raws = ctc_greedy_decoder(out, alphabet)
         offset = 0
         for L in lab_lens.tolist():
@@ -199,7 +192,6 @@ for epoch in range(1, epochs + 1):
             offset += L
             train_refs.append("".join(alphabet[i - 1] for i in seq if i > 0))
         train_hyps.extend(preds)
-
     avg_train_loss = train_loss / len(train_loader)
     train_acc = compute_accuracy(train_refs, train_hyps)
     train_cer = sum(
@@ -208,10 +200,21 @@ for epoch in range(1, epochs + 1):
     train_wer = sum(
         word_error_rate(r, h) for r, h in zip(train_refs, train_hyps)
     ) / len(train_refs)
-
     writer.add_scalar("train/accuracy", train_acc, epoch)
     writer.add_scalar("train/CER", train_cer, epoch)
     writer.add_scalar("train/WER", train_wer, epoch)
+
+    # Log STN outputs for 5 random train examples
+    if model.stn is not None:
+        imgs_tr, _, _, _ = next(iter(train_loader))
+        imgs_tr = imgs_tr.to(device)
+        with torch.no_grad():
+            stn_tr_out = model.stn(imgs_tr)
+        N = min(5, stn_tr_out.size(0))
+        grid_tr = vutils.make_grid(
+            stn_tr_out[:N], nrow=N, normalize=False, scale_each=True
+        )
+        writer.add_image("STN/Train_Examples", grid_tr, epoch)
 
     # --- Validation ---
     model.eval()
@@ -221,12 +224,10 @@ for epoch in range(1, epochs + 1):
         for imgs, labs, _, lab_lens in val_loader:
             imgs, labs = imgs.to(device), labs.to(device)
             lab_lens = lab_lens.to(device)
-
             out = model(imgs)
             Tm, B, _ = out.size()
             inp_lens = torch.full((B,), Tm, dtype=torch.long, device=device)
             val_loss += criterion(out, labs, inp_lens, lab_lens).item()
-
             preds, raws = ctc_greedy_decoder(out, alphabet)
             offset = 0
             for L in lab_lens.tolist():
@@ -234,7 +235,6 @@ for epoch in range(1, epochs + 1):
                 offset += L
                 val_refs.append("".join(alphabet[i - 1] for i in seq if i > 0))
             val_hyps.extend(preds)
-
     avg_val_loss = val_loss / len(val_loader)
     val_acc = compute_accuracy(val_refs, val_hyps)
     val_cer = sum(character_error_rate(r, h) for r, h in zip(val_refs, val_hyps)) / len(
@@ -243,15 +243,24 @@ for epoch in range(1, epochs + 1):
     val_wer = sum(word_error_rate(r, h) for r, h in zip(val_refs, val_hyps)) / len(
         val_refs
     )
-
     writer.add_scalar("val/loss", avg_val_loss, epoch)
     writer.add_scalar("val/accuracy", val_acc, epoch)
     writer.add_scalar("val/CER", val_cer, epoch)
     writer.add_scalar("val/WER", val_wer, epoch)
 
-    lr = optimizer.param_groups[0]["lr"]
+    # Log STN outputs for 5 random val examples
+    if model.stn is not None:
+        imgs_val, _, _, _ = next(iter(val_loader))
+        imgs_val = imgs_val.to(device)
+        with torch.no_grad():
+            stn_val_out = model.stn(imgs_val)
+        N = min(5, stn_val_out.size(0))
+        grid_val = vutils.make_grid(
+            stn_val_out[:N], nrow=N, normalize=False, scale_each=True
+        )
+        writer.add_image("STN/Val_Examples", grid_val, epoch)
 
-    # Record metrics to CSV
+    # --- Record metrics & checkpoints ---
     with open(metrics_csv, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(
@@ -265,72 +274,72 @@ for epoch in range(1, epochs + 1):
                 f"{val_acc:.6f}",
                 f"{val_cer:.6f}",
                 f"{val_wer:.6f}",
-                f"{lr:.6f}",
+                f"{optimizer.param_groups[0]['lr']:.6f}",
             ]
         )
-
-    # Checkpoint by loss
+    # Checkpoint by val loss
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
         torch.save(model.state_dict(), os.path.join(checkpoint_dir, "best_by_loss.pth"))
         with open(best_txt, "a", encoding="utf-8") as f:
             f.write(f"[Epoch {epoch}] best val_loss = {best_val_loss:.6f}\n")
-
-    # Checkpoint by accuracy
+    # Checkpoint by val acc
     if val_acc > best_val_acc:
         best_val_acc = val_acc
         torch.save(model.state_dict(), os.path.join(checkpoint_dir, "best_by_acc.pth"))
         with open(best_txt, "a", encoding="utf-8") as f:
             f.write(f"[Epoch {epoch}] best val_acc  = {best_val_acc:.6f}\n")
 
-    # LR scheduler step
     scheduler.step(avg_val_loss)
-    writer.add_scalar("learning_rate", lr, epoch)
-
     print(
         f"Epoch {epoch}/{epochs} | "
         f"TrainLoss={avg_train_loss:.4f} Acc={train_acc:.4f} CER={train_cer:.4f} WER={train_wer:.4f} | "
         f"ValLoss={avg_val_loss:.4f} Acc={val_acc:.4f} CER={val_cer:.4f} WER={val_wer:.4f} | "
-        f"LR={lr:.6f}"
+        f"LR={optimizer.param_groups[0]['lr']:.6f}"
     )
 
-    # Log sample predictions on validation
-    imgs, labs, _, lab_lens = next(iter(val_loader))
-    imgs = imgs.to(device)
+    # --- Log sample predictions ---
+    imgs_v, labs_v, _, lab_lens_v = next(iter(val_loader))
+    imgs_v = imgs_v.to(device)
     with torch.no_grad():
-        out = model(imgs)
-    preds, raws = ctc_greedy_decoder(out, alphabet)
-    truths = []
-    offset = 0
-    for L in lab_lens.tolist():
-        seq = labs[offset : offset + L].tolist()
+        out_v = model(imgs_v)
+    preds_v, raws_v = ctc_greedy_decoder(out_v, alphabet)
+    truths_v, offset = [], 0
+    for L in lab_lens_v.tolist():
+        seq = labs_v[offset : offset + L].tolist()
         offset += L
-        truths.append("".join(alphabet[i - 1] for i in seq if i > 0))
-    log_samples(
-        epoch, imgs, lab_lens, preds, raws, truths, writer, n=30, tag="Val/Examples"
-    )
-
-    # Log sample predictions on training
-    imgs_tr, labs_tr, _, lab_lens_tr = next(iter(train_loader))
-    imgs_tr = imgs_tr.to(device)
-    with torch.no_grad():
-        out_tr = model(imgs_tr)
-    preds_tr, raws_tr = ctc_greedy_decoder(out_tr, alphabet)
-    truths_tr = []
-    offset = 0
-    for L in lab_lens_tr.tolist():
-        seq = labs_tr[offset : offset + L].tolist()
-        offset += L
-        truths_tr.append("".join(alphabet[i - 1] for i in seq if i > 0))
+        truths_v.append("".join(alphabet[i - 1] for i in seq if i > 0))
     log_samples(
         epoch,
-        imgs_tr,
-        lab_lens_tr,
-        preds_tr,
-        raws_tr,
-        truths_tr,
+        imgs_v,
+        lab_lens_v,
+        preds_v,
+        raws_v,
+        truths_v,
         writer,
-        n=30,
+        n=10,
+        tag="Val/Examples",
+    )
+
+    imgs_t, labs_t, _, lab_lens_t = next(iter(train_loader))
+    imgs_t = imgs_t.to(device)
+    with torch.no_grad():
+        out_t = model(imgs_t)
+    preds_t, raws_t = ctc_greedy_decoder(out_t, alphabet)
+    truths_t, offset = [], 0
+    for L in lab_lens_t.tolist():
+        seq = labs_t[offset : offset + L].tolist()
+        offset += L
+        truths_t.append("".join(alphabet[i - 1] for i in seq if i > 0))
+    log_samples(
+        epoch,
+        imgs_t,
+        lab_lens_t,
+        preds_t,
+        raws_t,
+        truths_t,
+        writer,
+        n=10,
         tag="Train/Examples",
     )
 

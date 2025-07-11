@@ -78,8 +78,10 @@ class TPS_STN(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-        src_pts = self.loc_net(x).view(B, self.num_fiducial, 2)
+        delta = self.loc_net(x).view(B, self.num_fiducial, 2) * 0.1
         dst_pts = self.target_control_points.unsqueeze(0).expand(B, -1, -1)
+        src_pts = dst_pts + delta  # src_pts ≈ dst_pts ± 0.1
+
         kernel_w, affine_w = get_tps_transform(src_pts, dst_pts)
         return warp_image_tps(x, src_pts, kernel_w, affine_w, align_corners=True)
 
