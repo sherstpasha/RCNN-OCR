@@ -11,6 +11,7 @@ import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
+from vocab import build_vocab, SPECIAL_TOKENS
 
 
 class AddGaussianNoise:
@@ -90,7 +91,10 @@ class OCRDataset(Dataset):
         augment: bool = False,
         zoom_prob: float = 0.2,
         zoom_ratio: float = 0.2,
+        use_seq2seq: bool = False,
     ):
+        self.use_seq2seq = use_seq2seq
+
         # 1) читаем CSV
         samples = []
         with open(csv_path, newline="", encoding=encoding) as f:
@@ -159,6 +163,9 @@ class OCRDataset(Dataset):
             ]
         )
 
+        self.vocab, self.inv_vocab = build_vocab(self.alphabet)
+        self.char2idx = {c: i + 1 for i, c in enumerate(self.alphabet)}
+
     def __len__(self):
         return len(self.samples)
 
@@ -201,19 +208,42 @@ class OCRDataset(Dataset):
 
         # — 7) encode label → indices
         lab = torch.tensor([self.char2idx[c] for c in label], dtype=torch.long)
+
+        if self.use_seq2seq:
+            tokens = [self.vocab["<sos>"]] + [self.vocab[c] for c in label] + [self.vocab["<eos>"]]
+            lab = torch.tensor(tokens, dtype=torch.long)
+        else:
+            lab = torch.tensor([self.char2idx[c] for c in label], dtype=torch.long)
+
         return tensor, lab
 
     @staticmethod
     def collate_fn(batch):
         imgs, labs = zip(*batch)
-        imgs = torch.stack(imgs)  # [B,1,H,W]
+        imgs = torch.stack(imgs)
         lab_lens = torch.tensor([len(l) for l in labs], dtype=torch.long)
         labs_cat = torch.cat(labs)
         B, _, H, W = imgs.shape
-        # после всех пулов обычно W//4
         inp_lens = torch.full((B,), W // 4, dtype=torch.long)
         return imgs, labs_cat, inp_lens, lab_lens
 
+    @staticmethod
+    def collate_fn_seq2seq(batch):
+        from torch.nn.utils.rnn import pad_sequence
+        imgs, labs = zip(*batch)
+        imgs = torch.stack(imgs)
+        max_len = max(len(l) for l in labs)
+
+        # decoder_input = [<sos>, ..., last_token]
+        # target = [..., <eos>]
+        decoder_inputs = [l[:-1] for l in labs]
+        targets = [l[1:] for l in labs]
+
+        decoder_inputs_padded = pad_sequence(decoder_inputs, batch_first=True, padding_value=0)
+        targets_padded = pad_sequence(targets, batch_first=True, padding_value=0)
+
+        return imgs, decoder_inputs_padded, targets_padded
+    
     @staticmethod
     def build_alphabet(
         csv_paths: List[str], min_char_freq: int = 1, encoding: str = "utf-8"

@@ -6,6 +6,108 @@ import torch.nn.functional as F
 import torchvision.models as models
 from torchvision.models import ResNet18_Weights
 from kornia.geometry.transform import get_tps_transform, warp_image_tps
+from vocab import SPECIAL_TOKENS
+
+
+class CNNEncoder(nn.Module):
+    def __init__(self, backbone="resnet", pretrained=True):
+        super().__init__()
+        if backbone == "resnet":
+            weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+            net = models.resnet18(weights=weights)
+            orig = net.conv1
+            net.conv1 = nn.Conv2d(
+                1,
+                orig.out_channels,
+                kernel_size=orig.kernel_size,
+                stride=(1, 1),
+                padding=orig.padding,
+                bias=False,
+            )
+            if pretrained:
+                with torch.no_grad():
+                    net.conv1.weight[:] = orig.weight.sum(dim=1, keepdim=True)
+            net.maxpool = nn.Identity()
+            self.cnn = nn.Sequential(*list(net.children())[:-2])  # remove avgpool/fc
+            self.out_channels = 512
+        else:
+            raise NotImplementedError("Only resnet supported in this version")
+
+    def forward(self, x):  # x: [B,1,H,W]
+        f = self.cnn(x)     # [B,C,H',W']
+        f = torch.mean(f, dim=2)  # global average over height → [B,C,W']
+        f = f.permute(2, 0, 1)    # → [W',B,C]
+        return f
+    
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=500):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)  # [T, D]
+        position = torch.arange(0, max_len).unsqueeze(1)  # [T, 1]
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-torch.log(torch.tensor(10000.0)) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(1)  # [T, 1, D]
+        self.register_buffer("pe", pe)
+
+    def forward(self, x):  # x: [T, B, D]
+        return x + self.pe[:x.size(0)]
+
+
+class TransformerOCRModel(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int = 256,
+        num_layers: int = 4,
+        nhead: int = 4,
+        dim_feedforward: int = 512,
+        dropout: float = 0.1,
+        backbone: str = "resnet",
+    ):
+        super().__init__()
+        self.encoder_cnn = CNNEncoder(backbone=backbone)
+        self.d_model = d_model
+
+        self.encoder_proj = nn.Linear(self.encoder_cnn.out_channels, d_model)
+        self.decoder_embed = nn.Embedding(vocab_size, d_model)
+        self.pos_encoder = PositionalEncoding(d_model)
+        self.pos_decoder = PositionalEncoding(d_model)
+
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=False,
+        )
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        self.output_layer = nn.Linear(d_model, vocab_size)
+
+    def generate_square_subsequent_mask(self, sz: int, device: torch.device):
+        mask = torch.triu(torch.ones(sz, sz, device=device), diagonal=1)
+        return mask.masked_fill(mask == 1, float("-inf"))
+
+    def forward(self, imgs, tgt_inp):
+        # imgs: [B, 1, H, W]
+        # tgt_inp: [B, T] (token IDs with <sos>)
+
+        memory = self.encoder_cnn(imgs)  # [S, B, C]
+        memory = self.encoder_proj(memory)  # [S, B, D]
+        memory = self.pos_encoder(memory)
+
+        tgt = self.decoder_embed(tgt_inp).permute(1, 0, 2)  # [T, B, D]
+        tgt = self.pos_decoder(tgt)
+
+        tgt_mask = self.generate_square_subsequent_mask(tgt.size(0), tgt.device)  # [T,T]
+
+        out = self.transformer_decoder(
+            tgt,
+            memory,
+            tgt_mask=tgt_mask,
+        )  # [T, B, D]
+        out = self.output_layer(out)  # [T, B, vocab]
+        return out
 
 
 def build_fiducial_points(num_fiducial: int) -> torch.Tensor:

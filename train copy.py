@@ -3,14 +3,6 @@ import csv
 import random
 import warnings
 import textwrap
-from ctc_decoder import CTCDecoder
-
-# suppress TF & oneDNN warnings
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-warnings.filterwarnings(
-    "ignore", category=UserWarning, module="torchvision.models._utils"
-)
 
 import numpy as np
 import torch
@@ -22,18 +14,13 @@ import matplotlib.pyplot as plt
 import torchvision.utils as vutils
 
 from dataset import OCRDataset
-from model import CRNN
-from utils import ctc_greedy_decoder
+from model import TransformerOCRModel
+from vocab import build_vocab, SPECIAL_TOKENS
 from metrics import character_error_rate, word_error_rate, compute_accuracy
 
-
-def log_samples(
-    epoch, imgs, lab_lens, preds, raws, truths, writer, n=10, tag="Examples"
-):
-    """
-    Показывает первые n примеров из батча в TensorBoard.
-    tag — название вкладки (например, 'Examples' или 'Train/Examples').
-    """
+# -------------------------------------------------------------------
+# Функция для логирования примеров в TensorBoard
+def log_samples_seq2seq(epoch, imgs, preds, truths, writer, n=10, tag="Examples"):
     n = min(n, len(truths))
     fig, axs = plt.subplots(n, 1, figsize=(6, 2 * n))
     for i in range(n):
@@ -41,14 +28,46 @@ def log_samples(
         axs[i].imshow(img_np, cmap="gray")
         title = f"GT: {truths[i]} | Pred: {preds[i]}"
         wrapped = "\n".join(textwrap.wrap(title, width=40))
-        raw_str = raws[i]
-        axs[i].set_title(f"{wrapped}\nRaw: {raw_str}", fontsize=8)
+        axs[i].set_title(wrapped, fontsize=8)
         axs[i].axis("off")
     writer.add_figure(tag, fig, epoch)
     plt.close(fig)
 
+# -------------------------------------------------------------------
+# Жадный декодер (greedy) для Transformer
+def greedy_decode_batch(model, imgs, inv_vocab, sos_id, eos_id, max_len=32, device="cpu"):
+    """
+    imgs: [B,1,H,W]
+    Возвращает preds: List[str], raws: List[str]
+    """
+    model.eval()
+    B = imgs.size(0)
+    preds, raws = [""] * B, [""] * B
+    with torch.no_grad():
+        # начнём со все <sos>
+        cur_input = torch.full((B, 1), sos_id, dtype=torch.long, device=device)  # [B,1]
+        for _step in range(max_len):
+            out = model(imgs, cur_input)           # [T, B, V]
+            logits = out[-1, :, :]                  # последний шаг [B,V]
+            next_tokens = logits.argmax(dim=-1)     # [B]
+            cur_input = torch.cat([cur_input, next_tokens.unsqueeze(1)], dim=1)  # append
+        # теперь cur_input: [B, L_pred]
+        for b in range(B):
+            seq = cur_input[b].tolist()[1:]  # пропустили <sos>
+            string = ""
+            raw = []
+            for t in seq:
+                if t == eos_id:
+                    break
+                ch = inv_vocab.get(t, "")
+                string += ch
+                raw.append(ch)
+            preds[b] = string
+            raws[b] = "".join(raw)
+    return preds, raws
 
-# 1) Fix random seeds for reproducibility
+# -------------------------------------------------------------------
+# 1) Fix random seeds
 seed = 42
 random.seed(seed)
 np.random.seed(seed)
@@ -57,290 +76,178 @@ torch.cuda.manual_seed_all(seed)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-# 2) Experiment settings
-experiment_name = "exp_1_archive"
+# 2) Settings
+use_seq2seq = True
+experiment_name = "transformer_ocr"
 log_dir = os.path.join("runs", experiment_name)
 checkpoint_dir = os.path.join("checkpoints", experiment_name)
 os.makedirs(log_dir, exist_ok=True)
 os.makedirs(checkpoint_dir, exist_ok=True)
 
-# 3) Hyperparameters & paths
 img_height, img_max_width = 60, 240
-batch_size, epochs = 16 * 8, 40
+batch_size, epochs = 64, 40
 learning_rate = 1e-3
 
-# 4) Data annotation files and their image roots
-train_csvs = [r"C:\data_19_04\Archive_19_04\data_cyrillic\gt_train.txt"]
-train_image_roots = [r"C:\data_19_04\Archive_19_04\data_cyrillic\train"]
-val_csvs = [r"C:\data_19_04\Archive_19_04\data_cyrillic\gt_test.txt"]
-val_image_roots = [r"C:\data_19_04\Archive_19_04\data_cyrillic\test"]
+train_csvs = [r"C:\shared\Archive_19_04\data_cyrillic\gt_train.txt"]
+train_image_roots = [r"C:\shared\Archive_19_04\data_cyrillic\train"]
+val_csvs = [r"C:\shared\Archive_19_04\data_cyrillic\gt_test.txt"]
+val_image_roots = [r"C:\shared\Archive_19_04\data_cyrillic\test"]
 
-# 5) Build alphabet from all CSVs, filtering rare chars
-alphabet = OCRDataset.build_alphabet(
-    train_csvs + val_csvs, min_char_freq=30, encoding="utf-8"
-)
+# 3) Alphabet & Vocab
+alphabet = OCRDataset.build_alphabet(train_csvs + val_csvs, min_char_freq=30, encoding="utf-8")
 print(f"Using alphabet ({len(alphabet)}): {alphabet}")
-num_classes = len(alphabet) + 1  # +1 for CTC blank
+vocab, inv_vocab = build_vocab(alphabet)
+vocab_size = len(vocab)
+sos_id, eos_id, pad_id = SPECIAL_TOKENS["<sos>"], SPECIAL_TOKENS["<eos>"], SPECIAL_TOKENS["<pad>"]
 
-decoder = CTCDecoder(
-    alphabet=alphabet,
-    use_beam=True,  # 🔁 переключи на False для Greedy
-    kenlm_path="checkpoints/exp_1_archive/3gram.binary",  # или None, если без LM
-)
+# 4) Data
+train_ds = ConcatDataset([
+    OCRDataset(csv_path=p, images_dir=r, alphabet=alphabet,
+               img_height=img_height, img_max_width=img_max_width,
+               augment=True, use_seq2seq=use_seq2seq)
+    for p,r in zip(train_csvs, train_image_roots)
+])
+val_ds = ConcatDataset([
+    OCRDataset(csv_path=p, images_dir=r, alphabet=alphabet,
+               img_height=img_height, img_max_width=img_max_width,
+               augment=False, use_seq2seq=use_seq2seq)
+    for p,r in zip(val_csvs, val_image_roots)
+])
+collate_fn = OCRDataset.collate_fn_seq2seq if use_seq2seq else OCRDataset.collate_fn
+train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
-# 6) Create datasets and dataloaders
-train_datasets, val_datasets = [], []
-for csv_path, img_root in zip(train_csvs, train_image_roots):
-    train_datasets.append(
-        OCRDataset(
-            csv_path=csv_path,
-            images_dir=img_root,
-            alphabet=alphabet,
-            img_height=img_height,
-            img_max_width=img_max_width,
-            min_char_freq=1,
-            augment=False,
-        )
-    )
-for csv_path, img_root in zip(val_csvs, val_image_roots):
-    val_datasets.append(
-        OCRDataset(
-            csv_path=csv_path,
-            images_dir=img_root,
-            alphabet=alphabet,
-            img_height=img_height,
-            img_max_width=img_max_width,
-            min_char_freq=1,
-            augment=False,
-        )
-    )
-train_ds = ConcatDataset(train_datasets)
-val_ds = ConcatDataset(val_datasets)
-train_loader = DataLoader(
-    train_ds, batch_size=batch_size, shuffle=True, collate_fn=OCRDataset.collate_fn
-)
-val_loader = DataLoader(
-    val_ds, batch_size=batch_size, shuffle=False, collate_fn=OCRDataset.collate_fn
-)
-
-# 7) Model, loss, optimizer, scheduler
+# 5) Model, Loss, Optimizer, Scheduler
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
-model = CRNN(
-    img_height,
-    img_max_width,
-    num_classes,
-    pretrained=False,
-    transform="tps",
-    backbone="vgg",
-).to(device)
-criterion = nn.CTCLoss(blank=0, zero_infinity=True)
+model = TransformerOCRModel(vocab_size=vocab_size, backbone="resnet").to(device)
+criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-scheduler = lr_scheduler.ReduceLROnPlateau(
-    optimizer, mode="min", factor=0.5, patience=2
-)
+scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
 
-# 8) TensorBoard writer
+# 6) TensorBoard & metrics files
 writer = SummaryWriter(log_dir=log_dir)
-
-# 9) Prepare metrics history files
 metrics_csv = os.path.join(checkpoint_dir, "metrics_history.csv")
 with open(metrics_csv, "w", newline="", encoding="utf-8") as f:
     w = csv.writer(f)
-    w.writerow(
-        [
-            "epoch",
-            "train_loss",
-            "train_acc",
-            "train_cer",
-            "train_wer",
-            "val_loss",
-            "val_acc",
-            "val_cer",
-            "val_wer",
-            "lr",
-        ]
-    )
-best_txt = os.path.join(checkpoint_dir, "best_metrics.txt")
-with open(best_txt, "w", encoding="utf-8") as f:
-    f.write(f"Experiment: {experiment_name}\n\n")
-best_val_loss, best_val_acc = float("inf"), 0.0
-
+    w.writerow(["epoch", "train_loss", "val_loss", "val_acc", "val_cer", "val_wer", "lr"])
+best_val_loss = float("inf")
 global_step = 0
-for epoch in range(1, epochs + 1):
+
+# 7) Training loop
+for epoch in range(1, epochs+1):
     # --- Train ---
     model.train()
     train_loss = 0.0
-    train_refs, train_hyps = [], []
-    for imgs, labs, _, lab_lens in train_loader:
-        imgs, labs = imgs.to(device), labs.to(device)
-        lab_lens = lab_lens.to(device)
+    for imgs, decoder_input, targets in train_loader:
+        imgs, decoder_input, targets = imgs.to(device), decoder_input.to(device), targets.to(device)
         optimizer.zero_grad()
-        out = model(imgs)
-        Tm, B, _ = out.size()
-        inp_lens = torch.full((B,), Tm, dtype=torch.long, device=device)
-        loss = criterion(out, labs, inp_lens, lab_lens)
+        out = model(imgs, decoder_input)        # [T, B, V]
+        out = out.permute(1, 0, 2)              # [B, T, V]
+        loss = criterion(out.reshape(-1, vocab_size), targets.reshape(-1))
         loss.backward()
         optimizer.step()
         writer.add_scalar("train/loss", loss.item(), global_step)
         train_loss += loss.item()
         global_step += 1
-        preds, raws = ctc_greedy_decoder(out, alphabet)
-        offset = 0
-        for L in lab_lens.tolist():
-            seq = labs[offset : offset + L].tolist()
-            offset += L
-            train_refs.append("".join(alphabet[i - 1] for i in seq if i > 0))
-        train_hyps.extend(preds)
-    avg_train_loss = train_loss / len(train_loader)
-    train_acc = compute_accuracy(train_refs, train_hyps)
-    train_cer = sum(
-        character_error_rate(r, h) for r, h in zip(train_refs, train_hyps)
-    ) / len(train_refs)
-    train_wer = sum(
-        word_error_rate(r, h) for r, h in zip(train_refs, train_hyps)
-    ) / len(train_refs)
-    writer.add_scalar("train/accuracy", train_acc, epoch)
-    writer.add_scalar("train/CER", train_cer, epoch)
-    writer.add_scalar("train/WER", train_wer, epoch)
 
-    # Log STN outputs for 5 random train examples
-    if model.stn is not None:
-        imgs_tr, _, _, _ = next(iter(train_loader))
-        imgs_tr = imgs_tr.to(device)
-        with torch.no_grad():
-            stn_tr_out = model.stn(imgs_tr)
-        N = min(5, stn_tr_out.size(0))
-        grid_tr = vutils.make_grid(
-            stn_tr_out[:N], nrow=N, normalize=False, scale_each=True
-        )
-        writer.add_image("STN/Train_Examples", grid_tr, epoch)
+    avg_train_loss = train_loss / len(train_loader)
 
     # --- Validation ---
     model.eval()
     val_loss = 0.0
-    val_refs, val_hyps = [], []
+    all_preds, all_truths = [], []
     with torch.no_grad():
-        for imgs, labs, _, lab_lens in val_loader:
-            imgs, labs = imgs.to(device), labs.to(device)
-            lab_lens = lab_lens.to(device)
-            out = model(imgs)
-            Tm, B, _ = out.size()
-            inp_lens = torch.full((B,), Tm, dtype=torch.long, device=device)
-            val_loss += criterion(out, labs, inp_lens, lab_lens).item()
-            preds, raws = ctc_greedy_decoder(out, alphabet)
-            offset = 0
-            for L in lab_lens.tolist():
-                seq = labs[offset : offset + L].tolist()
-                offset += L
-                val_refs.append("".join(alphabet[i - 1] for i in seq if i > 0))
-            val_hyps.extend(preds)
+        for imgs, decoder_input, targets in val_loader:
+            imgs, decoder_input, targets = imgs.to(device), decoder_input.to(device), targets.to(device)
+            out = model(imgs, decoder_input).permute(1,0,2)
+            val_loss += criterion(out.reshape(-1, vocab_size), targets.reshape(-1)).item()
+            # собираем ground truth
+            for seq in targets.cpu().tolist():
+                # пропускаем <pad>, считаем до <eos>
+                s = "".join(inv_vocab[t] for t in seq if t!=pad_id and t!=eos_id and t!=sos_id)
+                all_truths.append(s)
+
     avg_val_loss = val_loss / len(val_loader)
-    val_acc = compute_accuracy(val_refs, val_hyps)
-    val_cer = sum(character_error_rate(r, h) for r, h in zip(val_refs, val_hyps)) / len(
-        val_refs
-    )
-    val_wer = sum(word_error_rate(r, h) for r, h in zip(val_refs, val_hyps)) / len(
-        val_refs
-    )
+
+    # —— greedy decode для метрик и логов
+    sample_imgs, _, _ = next(iter(val_loader))
+    sample_imgs = sample_imgs.to(device)
+    preds, raws = greedy_decode_batch(model, sample_imgs, inv_vocab, sos_id, eos_id, device=device)
+    truths = []
+    # ground truths для этого батча
+    for seq in sample_imgs.new_zeros(1): pass  # placeholder
+    # на самом деле берем первые B из all_truths
+    truths = all_truths[: len(preds) ]
+
+    # Метрики
+    val_acc = compute_accuracy(all_truths, 
+                               greedy_decode_batch(model, 
+                                                   torch.cat([sample_imgs for _ in range(1)],0),
+                                                   inv_vocab, sos_id, eos_id, device=device)[0])
+    val_cer = np.mean([
+        character_error_rate(r, h)
+        for r, h in zip(
+            all_truths,
+            greedy_decode_batch(
+                model,
+                sample_imgs,
+                inv_vocab,       # ← тут было invocab
+                sos_id,
+                eos_id,
+                device=device
+            )[0]
+        )
+    ])
+    val_wer = np.mean([
+        word_error_rate(r, h)
+        for r, h in zip(
+            all_truths,
+            greedy_decode_batch(
+                model,
+                sample_imgs,
+                inv_vocab,       # ← и тут
+                sos_id,
+                eos_id,
+                device=device
+            )[0]
+        )
+    ])
+
     writer.add_scalar("val/loss", avg_val_loss, epoch)
     writer.add_scalar("val/accuracy", val_acc, epoch)
     writer.add_scalar("val/CER", val_cer, epoch)
     writer.add_scalar("val/WER", val_wer, epoch)
 
-    # Log STN outputs for 5 random val examples
-    if model.stn is not None:
-        imgs_val, _, _, _ = next(iter(val_loader))
-        imgs_val = imgs_val.to(device)
-        with torch.no_grad():
-            stn_val_out = model.stn(imgs_val)
-        N = min(5, stn_val_out.size(0))
-        grid_val = vutils.make_grid(
-            stn_val_out[:N], nrow=N, normalize=False, scale_each=True
-        )
-        writer.add_image("STN/Val_Examples", grid_val, epoch)
+    scheduler.step(avg_val_loss)
 
-    # --- Record metrics & checkpoints ---
-    with open(metrics_csv, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(
-            [
-                epoch,
-                f"{avg_train_loss:.6f}",
-                f"{train_acc:.6f}",
-                f"{train_cer:.6f}",
-                f"{train_wer:.6f}",
-                f"{avg_val_loss:.6f}",
-                f"{val_acc:.6f}",
-                f"{val_cer:.6f}",
-                f"{val_wer:.6f}",
-                f"{optimizer.param_groups[0]['lr']:.6f}",
-            ]
-        )
-    # Checkpoint by val loss
+    # Сохраняем лучший чекпоинт
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
-        torch.save(model.state_dict(), os.path.join(checkpoint_dir, "best_by_loss.pth"))
-        with open(best_txt, "a", encoding="utf-8") as f:
-            f.write(f"[Epoch {epoch}] best val_loss = {best_val_loss:.6f}\n")
-    # Checkpoint by val acc
-    if val_acc > best_val_acc:
-        best_val_acc = val_acc
-        torch.save(model.state_dict(), os.path.join(checkpoint_dir, "best_by_acc.pth"))
-        with open(best_txt, "a", encoding="utf-8") as f:
-            f.write(f"[Epoch {epoch}] best val_acc  = {best_val_acc:.6f}\n")
+        torch.save(model.state_dict(), os.path.join(checkpoint_dir, "best_model.pth"))
 
-    scheduler.step(avg_val_loss)
+    # Запись в CSV
+    with open(metrics_csv, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            epoch,
+            f"{avg_train_loss:.6f}",
+            f"{avg_val_loss:.6f}",
+            f"{val_acc:.6f}",
+            f"{val_cer:.6f}",
+            f"{val_wer:.6f}",
+            f"{optimizer.param_groups[0]['lr']:.6f}",
+        ])
+
+    # Логи в консоль
     print(
         f"Epoch {epoch}/{epochs} | "
-        f"TrainLoss={avg_train_loss:.4f} Acc={train_acc:.4f} CER={train_cer:.4f} WER={train_wer:.4f} | "
-        f"ValLoss={avg_val_loss:.4f} Acc={val_acc:.4f} CER={val_cer:.4f} WER={val_wer:.4f} | "
+        f"TrainLoss={avg_train_loss:.4f} | ValLoss={avg_val_loss:.4f} | "
+        f"Acc={val_acc:.4f} CER={val_cer:.4f} WER={val_wer:.4f} | "
         f"LR={optimizer.param_groups[0]['lr']:.6f}"
     )
 
-    # --- Log sample predictions ---
-    imgs_v, labs_v, _, lab_lens_v = next(iter(val_loader))
-    imgs_v = imgs_v.to(device)
-    with torch.no_grad():
-        out_v = model(imgs_v)
-    preds_v, raws_v = ctc_greedy_decoder(out_v, alphabet)
-    truths_v, offset = [], 0
-    for L in lab_lens_v.tolist():
-        seq = labs_v[offset : offset + L].tolist()
-        offset += L
-        truths_v.append("".join(alphabet[i - 1] for i in seq if i > 0))
-    log_samples(
-        epoch,
-        imgs_v,
-        lab_lens_v,
-        preds_v,
-        raws_v,
-        truths_v,
-        writer,
-        n=10,
-        tag="Val/Examples",
-    )
-
-    imgs_t, labs_t, _, lab_lens_t = next(iter(train_loader))
-    imgs_t = imgs_t.to(device)
-    with torch.no_grad():
-        out_t = model(imgs_t)
-    preds_t, raws_t = ctc_greedy_decoder(out_t, alphabet)
-    truths_t, offset = [], 0
-    for L in lab_lens_t.tolist():
-        seq = labs_t[offset : offset + L].tolist()
-        offset += L
-        truths_t.append("".join(alphabet[i - 1] for i in seq if i > 0))
-    log_samples(
-        epoch,
-        imgs_t,
-        lab_lens_t,
-        preds_t,
-        raws_t,
-        truths_t,
-        writer,
-        n=10,
-        tag="Train/Examples",
-    )
+    # Логирование примеров
+    log_samples_seq2seq(epoch, sample_imgs.cpu(), preds, truths, writer, n=10, tag="Val/Examples")
 
 writer.close()
