@@ -3,6 +3,7 @@ import csv
 import random
 import warnings
 import textwrap
+from tqdm import tqdm
 
 # suppress TF & oneDNN warnings
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
@@ -22,7 +23,7 @@ import torchvision.utils as vutils
 
 from dataset import OCRDataset
 from model import CRNN
-from utils import ctc_greedy_decoder, beam_search_decode
+from utils import decode
 from metrics import character_error_rate, word_error_rate, compute_accuracy
 import torch.nn.functional as F
 from vocab import SPECIAL_TOKENS
@@ -60,6 +61,24 @@ def log_samples(
     plt.close(fig)
 
 
+def get_worst_examples(
+    imgs_list, preds_list, truths_list, raws_list, lens_list, top_k=20
+):
+    cer_list = [
+        character_error_rate(gt, pred) for gt, pred in zip(truths_list, preds_list)
+    ]
+    # Каждая запись: (CER, img, pred, truth, raw, lens)
+    sorted_data = sorted(
+        zip(cer_list, imgs_list, preds_list, truths_list, raws_list, lens_list),
+        key=lambda x: x[0],
+        reverse=True,
+    )
+    top = sorted_data[:top_k]
+    # Распаковываем топ по полям
+    _, imgs, preds, truths, raws, lens = zip(*top)
+    return imgs, preds, truths, raws, lens
+
+
 # reproducibility
 seed = 42
 random.seed(seed)
@@ -70,7 +89,7 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
 # settings
-experiment_name = "exp_1_archive"
+experiment_name = "exp_1_archive1"
 log_dir = os.path.join("runs", experiment_name)
 checkpoint_dir = os.path.join("checkpoints", experiment_name)
 os.makedirs(log_dir, exist_ok=True)
@@ -80,23 +99,24 @@ os.makedirs(checkpoint_dir, exist_ok=True)
 img_height, img_max_width = 60, 240
 batch_size, epochs = 16 * 3, 60
 learning_rate = 1e-3
+decode_type = "greedy"
 
 # data
 train_csvs = [
     r"C:\data_19_04\Archive_19_04\data_archive\gt_train.txt",
-    r"C:\data_19_04\Archive_19_04\data_school\gt_train.txt",
+    # r"C:\data_19_04\Archive_19_04\data_school\gt_train.txt",
 ]
 train_roots = [
     r"C:\data_19_04\Archive_19_04\data_archive",
-    r"C:\data_19_04\Archive_19_04\\data_school",
+    # r"C:\data_19_04\Archive_19_04\\data_school",
 ]
 val_csvs = [
     r"C:\data_19_04\Archive_19_04\data_archive\gt_test.txt",
-    r"C:\data_19_04\Archive_19_04\data_school\gt_test.txt",
+    # r"C:\data_19_04\Archive_19_04\data_school\gt_test.txt",
 ]
 val_roots = [
     r"C:\data_19_04\Archive_19_04\data_archive",
-    r"C:\data_19_04\Archive_19_04\\data_school",
+    # r"C:\data_19_04\Archive_19_04\\data_school",
 ]
 
 alphabet = build_alphabet(train_csvs + val_csvs, min_char_freq=30, encoding="utf-8")
@@ -190,6 +210,20 @@ best_val_loss, best_val_acc = float("inf"), 0.0
 
 global_step = 0
 for epoch in range(1, epochs + 1):
+    (
+        imgs_all_train,
+        preds_all_train,
+        truths_all_train,
+        raws_all_train,
+        lens_all_train,
+    ) = ([], [], [], [], [])
+    imgs_all_val, preds_all_val, truths_all_val, raws_all_val, lens_all_val = (
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
     # === Train ===
     model.train()
 
@@ -197,7 +231,10 @@ for epoch in range(1, epochs + 1):
     attn_train_loss = 0.0
     train_refs, train_hyps = [], []
 
-    for imgs, labs_cat, inp_lens, lab_lens, dec_inputs, targets in train_loader:
+    for imgs, labs_cat, inp_lens, lab_lens, dec_inputs, targets in tqdm(
+        train_loader, desc=f"Train Epoch {epoch}"
+    ):
+
         imgs, labs_cat = imgs.to(device), labs_cat.to(device)
         inp_lens, lab_lens = inp_lens.to(device), lab_lens.to(device)
         dec_inputs, targets = dec_inputs.to(device), targets.to(device)
@@ -231,13 +268,26 @@ for epoch in range(1, epochs + 1):
         global_step += 1
 
         # decode CTC и собираем refs/hyps как раньше …
-        preds, raws = ctc_greedy_decoder(ctc_out, alphabet)
+        preds, raws = decode(ctc_out, alphabet, method=decode_type, beam_width=5)
         offset = 0
         for length in lab_lens.tolist():
             seq = labs_cat[offset : offset + length].tolist()
             offset += length
             train_refs.append("".join(alphabet[i - 1] for i in seq if i > 0))
         train_hyps.extend(preds)
+
+        # Накопим всё для худших примеров
+        imgs_all_train = [] if epoch == 1 else imgs_all_train
+        truths_all_train = [] if epoch == 1 else truths_all_train
+        preds_all_train = [] if epoch == 1 else preds_all_train
+        raws_all_train = [] if epoch == 1 else raws_all_train
+        lens_all_train = [] if epoch == 1 else lens_all_train
+
+        imgs_all_train.extend(imgs.cpu())
+        truths_all_train.extend(train_refs[-len(imgs) :])
+        preds_all_train.extend(train_hyps[-len(imgs) :])
+        raws_all_train.extend(raws)
+        lens_all_train.extend(lab_lens.cpu())
 
     # === Epoch‐level logging ===
     avg_ctc_train = ctc_train_loss / len(train_loader)
@@ -284,7 +334,10 @@ for epoch in range(1, epochs + 1):
     val_refs, val_hyps = [], []
 
     with torch.no_grad():
-        for imgs, labs_cat, _, lab_lens, dec_inputs, targets in val_loader:
+        for imgs, labs_cat, _, lab_lens, dec_inputs, targets in tqdm(
+            val_loader, desc=f"Val Epoch {epoch}"
+        ):
+
             imgs, labs_cat = imgs.to(device), labs_cat.to(device)
             lab_lens = lab_lens.to(device)
             dec_inputs, targets = dec_inputs.to(device), targets.to(device)
@@ -309,13 +362,24 @@ for epoch in range(1, epochs + 1):
             ).item()
 
             # 3) CTC-decoding для расчёта метрик
-            preds, raws = ctc_greedy_decoder(ctc_out, alphabet)
+            preds, raws = decode(ctc_out, alphabet, method=decode_type, beam_width=5)
             offset = 0
             for length in lab_lens.tolist():
                 seq = labs_cat[offset : offset + length].tolist()
                 offset += length
                 val_refs.append("".join(alphabet[i - 1] for i in seq if i > 0))
             val_hyps.extend(preds)
+
+            # === Сбор данных для логирования худших примеров (валидация)
+            imgs_all_val.extend(imgs.cpu())
+            offset = 0
+            for length in lab_lens.tolist():
+                seq = labs_cat[offset : offset + length].tolist()
+                offset += length
+                truths_all_val.append("".join(alphabet[i - 1] for i in seq if i > 0))
+            preds_all_val.extend(preds)
+            raws_all_val.extend(raws)
+            lens_all_val.extend(lab_lens.cpu())
 
     # Усреднённые лоссы
     avg_ctc_val = ctc_val_loss / len(val_loader)
@@ -390,44 +454,62 @@ for epoch in range(1, epochs + 1):
     )
 
     # --- Log sample predictions ---
-    imgs_v, labs_v, _, lab_lens_v, _, _ = next(iter(val_loader))
-    imgs_v = imgs_v.to(device)
-    with torch.no_grad():
-        out_v = model(imgs_v)
-    preds_v, raws_v = ctc_greedy_decoder(out_v, alphabet)
-    truths_v, offset = [], 0
-    for L in lab_lens_v.tolist():
-        seq = labs_v[offset : offset + L].tolist()
-        offset += L
-        truths_v.append("".join(alphabet[i - 1] for i in seq if i > 0))
-    log_samples(
-        epoch,
-        imgs_v,
-        lab_lens_v,
-        preds_v,
-        raws_v,
-        truths_v,
-        writer,
-        n=10,
-        tag="Val/Examples",
+    # === Log WORST VALIDATION ===
+    worst_imgs, worst_preds, worst_truths, worst_raws, worst_lens = get_worst_examples(
+        imgs_all_val,
+        preds_all_val,
+        truths_all_val,
+        raws_all_val,
+        lens_all_val,
+        top_k=20,
     )
-    imgs_t, labs_t, _, lab_lens_t, _, _ = next(iter(train_loader))
-    imgs_t = imgs_t.to(device)
-    with torch.no_grad():
-        out_t = model(imgs_t)
-    preds_t, raws_t = ctc_greedy_decoder(out_t, alphabet)
-    truths_t, offset = [], 0
-    for L in lab_lens_t.tolist():
-        seq = labs_t[offset : offset + L].tolist()
-        offset += L
-        truths_t.append("".join(alphabet[i - 1] for i in seq if i > 0))
     log_samples(
         epoch,
-        imgs_t,
-        lab_lens_t,
-        preds_t,
-        raws_t,
-        truths_t,
+        torch.stack(worst_imgs),
+        worst_lens,
+        worst_preds,
+        worst_raws,
+        worst_truths,
+        writer,
+        n=20,
+        tag="Val/Worst",
+    )
+
+    # === Log WORST TRAINING ===
+    worst_imgs, worst_preds, worst_truths, worst_raws, worst_lens = get_worst_examples(
+        imgs_all_train,
+        preds_all_train,
+        truths_all_train,
+        raws_all_train,
+        lens_all_train,
+        top_k=20,
+    )
+    log_samples(
+        epoch,
+        torch.stack(worst_imgs),
+        worst_lens,
+        worst_preds,
+        worst_raws,
+        worst_truths,
+        writer,
+        n=20,
+        tag="Train/Worst",
+    )
+    # === Log RANDOM TRAINING EXAMPLES from full epoch ===
+    idxs = random.sample(range(len(preds_all_train)), min(10, len(preds_all_train)))
+    rand_imgs = [imgs_all_train[i] for i in idxs]
+    rand_preds = [preds_all_train[i] for i in idxs]
+    rand_truths = [truths_all_train[i] for i in idxs]
+    rand_raws = [raws_all_train[i] for i in idxs]
+    rand_lens = [lens_all_train[i] for i in idxs]
+
+    log_samples(
+        epoch,
+        torch.stack(rand_imgs),
+        rand_lens,
+        rand_preds,
+        rand_raws,
+        rand_truths,
         writer,
         n=10,
         tag="Train/Examples",

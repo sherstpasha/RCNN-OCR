@@ -12,18 +12,6 @@ def load_crnn(
     pretrained: bool = False,
     transform: str = "none",
 ) -> CRNN:
-    """
-    Создаёт CRNN с опциональным STN/TPS, загружает веса из checkpoint и переводит сеть в eval-режим.
-
-    Args:
-        checkpoint_path: путь к файлу state_dict
-        img_height: высота входного изображения
-        img_width: ширина входного изображения (максимальная ширина для pooling/CTC)
-        num_classes: число классов (включая blank для CTC и спецтокены)
-        device: torch.device, куда загрузить модель
-        pretrained: использовать ImageNet-веса для бэкбона
-        transform: 'none', 'affine' или 'tps'
-    """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = CRNN(
@@ -36,25 +24,15 @@ def load_crnn(
 
 
 def ctc_greedy_decoder(out_probs, alphabet: str) -> (list[str], list[str]):
-    """
-    Greedy decoder for CTC outputs.
-    Принимает Tensor [T, B, C] или кортеж (ctc_out, attn_out).
-    Возвращает два списка длины B: (predictions, raw_sequences).
-    """
-    # Если модель вернула tuple, достаём CTC-логиты
     if isinstance(out_probs, tuple):
         out_probs = out_probs[0]
-
     indices = out_probs.argmax(dim=2)  # [T, B]
     seqs = indices.permute(1, 0).tolist()
-
     preds, raws = [], []
     max_idx = len(alphabet)
     for s in seqs:
-        # Raw sequence: '-' for blanks and out-of-range indices
         raw = " ".join(alphabet[i - 1] if (i > 0 and i <= max_idx) else "-" for i in s)
         raws.append(raw)
-        # Collapse repeats and filter blanks/out-of-range
         coll, prev = [], None
         for i in s:
             if i > 0 and i <= max_idx and i != prev:
@@ -64,7 +42,60 @@ def ctc_greedy_decoder(out_probs, alphabet: str) -> (list[str], list[str]):
     return preds, raws
 
 
-def beam_search_decode(
+def beam_search_ctc(out_probs, alphabet: str, beam_width: int = 5):
+    """
+    Beam Search decoding for CTC output.
+
+    Args:
+        out_probs: Tensor [T, B, C] — логиты CTC
+        alphabet: строка с символами
+        beam_width: ширина поиска
+
+    Returns:
+        Списки строковых предсказаний и "сырых" последовательностей
+    """
+    if isinstance(out_probs, tuple):
+        out_probs = out_probs[0]
+    log_probs = F.log_softmax(out_probs, dim=2)  # [T, B, C]
+    T, B, C = log_probs.shape
+    preds, raws = [], []
+
+    for b in range(B):
+        beam = [([], 0.0)]  # (sequence, log_prob)
+
+        for t in range(T):
+            new_beam = []
+            for seq, score in beam:
+                for c in range(C):
+                    new_seq = seq + [c]
+                    new_score = score + log_probs[t, b, c].item()
+                    new_beam.append((new_seq, new_score))
+            # Сохраняем top-K гипотез
+            new_beam.sort(key=lambda x: x[1], reverse=True)
+            beam = new_beam[:beam_width]
+
+        # Берём лучший результат
+        best_seq, _ = beam[0]
+
+        # raw output
+        raw = " ".join(
+            alphabet[i - 1] if i > 0 and i <= len(alphabet) else "-" for i in best_seq
+        )
+        raws.append(raw)
+
+        # collapse repeats + remove blank (0)
+        final = []
+        prev = None
+        for i in best_seq:
+            if i > 0 and i <= len(alphabet) and i != prev:
+                final.append(alphabet[i - 1])
+            prev = i
+        preds.append("".join(final))
+
+    return preds, raws
+
+
+def beam_search_attention(
     model,
     img,
     inv_vocab,
@@ -74,22 +105,6 @@ def beam_search_decode(
     max_len: int = 80,
     device: str = "cuda",
 ) -> str:
-    """
-    Beam-search decoding with attention decoder.
-
-    Args:
-        model: ваша CRNN+Attention модель
-        img: тензор [1,1,H,W]
-        inv_vocab: dict idx->token
-        sos_idx: индекс <sos>
-        eos_idx: индекс <eos>
-        beam_width: ширина beam
-        max_len: макс. длина последовательности
-        device: устройство
-
-    Returns:
-        Предсказанная строка (без <sos>, <eos>).
-    """
     model.eval()
     img = img.to(device)
     beams = [(0.0, [sos_idx])]
@@ -112,3 +127,12 @@ def beam_search_decode(
                 break
     best_seq = max(completed or beams, key=lambda x: x[0])[1]
     return "".join(inv_vocab[i] for i in best_seq if i not in (sos_idx, eos_idx))
+
+
+def decode(ctc_out, alphabet, method="beam", beam_width=5):
+    if method == "greedy":
+        return ctc_greedy_decoder(ctc_out, alphabet)
+    elif method == "beam":
+        return beam_search_ctc(ctc_out, alphabet, beam_width)
+    else:
+        raise ValueError(f"Unknown decoding method: {method}")
