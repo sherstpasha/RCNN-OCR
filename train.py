@@ -65,6 +65,8 @@ def log_samples(
 def get_worst_examples(
     imgs_list, preds_list, truths_list, raws_list, lens_list, top_k=20
 ):
+    if len(imgs_list) == 0:
+        return [], [], [], [], []
     cer_list = [
         character_error_rate(gt, pred) for gt, pred in zip(truths_list, preds_list)
     ]
@@ -102,7 +104,7 @@ batch_size, epochs = 16 * 3, 60
 learning_rate = 1e-3
 decode_type_train = "greedy"
 decode_type_val = "beam"
-val_interval = 5
+val_interval = 1
 
 # загрузить обученную модель
 lm_model = CharNGramLM.load("char6gram.pkl")
@@ -110,19 +112,19 @@ lm_alpha = 0.5  # вес LM при декодировании
 
 # data
 train_csvs = [
-    r"C:\data_19_04\Archive_19_04\data_archive\gt_train.txt",
+    r"C:\data_19_04\Archive_19_04\data_hkr\gt_train.txt",
     # r"C:\data_19_04\Archive_19_04\data_school\gt_train.txt",
 ]
 train_roots = [
-    r"C:\data_19_04\Archive_19_04\data_archive",
+    r"C:\data_19_04\Archive_19_04\data_hkr\train",
     # r"C:\data_19_04\Archive_19_04\\data_school",
 ]
 val_csvs = [
-    r"C:\data_19_04\Archive_19_04\data_archive\gt_test.txt",
+    r"C:\data_19_04\Archive_19_04\data_hkr\gt_test.txt",
     # r"C:\data_19_04\Archive_19_04\data_school\gt_test.txt",
 ]
 val_roots = [
-    r"C:\data_19_04\Archive_19_04\data_archive",
+    r"C:\data_19_04\Archive_19_04\data_hkr\test",
     # r"C:\data_19_04\Archive_19_04\\data_school",
 ]
 
@@ -132,11 +134,11 @@ num_ctc_classes = 1 + len(alphabet)  # blank + буквы
 num_attn_classes = len(SPECIAL_TOKENS) + len(alphabet)  # pad, sos, eos, unk + буквы
 
 
-def run_validation(epoch):
+def run_validation(epoch, imgs_list, preds_list, truths_list, raws_list, lens_list):
     model.eval()
     ctc_val_loss = 0.0
     attn_val_loss = 0.0
-    val_refs, val_hyps, val_raws, val_lens = [], [], [], []
+    val_refs, val_hyps = [], []
 
     with torch.no_grad():
         for imgs, labs_cat, _, lab_lens, dec_inputs, targets in tqdm(
@@ -167,14 +169,27 @@ def run_validation(epoch):
                 top_k_per_t=10,
             )
 
+            # Собираем батч для Worst‑examples
+            # 1) ground truths для батча
+            truths_batch = []
+            offset = 0
+            for length in lab_lens.tolist():
+                seq = labs_cat[offset : offset + length].tolist()
+                offset += length
+                truths_batch.append("".join(alphabet[i - 1] for i in seq if i > 0))
+            # 2) аппендим всё в переданные списки
+            imgs_list.extend(imgs.cpu())
+            truths_list.extend(truths_batch)
+            preds_list.extend(preds)
+            raws_list.extend(raws)
+            lens_list.extend(lab_lens.cpu())
+
             offset = 0
             for length in lab_lens.tolist():
                 seq = labs_cat[offset : offset + length].tolist()
                 offset += length
                 val_refs.append("".join(alphabet[i - 1] for i in seq if i > 0))
             val_hyps.extend(preds)
-            val_raws.extend(raws)
-            val_lens.extend(lab_lens.cpu())
 
     avg_ctc_val = ctc_val_loss / len(val_loader)
     avg_attn_val = attn_val_loss / len(val_loader)
@@ -406,8 +421,22 @@ for epoch in range(1, epochs + 1):
     # --- Validation & logging every val_interval epochs ---
     if epoch % val_interval == 0:
         # run validation
-        avg_val_loss, val_acc, val_cer, val_wer = run_validation(epoch)
+        imgs_all_val, preds_all_val, truths_all_val, raws_all_val, lens_all_val = (
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
 
+        avg_val_loss, val_acc, val_cer, val_wer = run_validation(
+            epoch,
+            imgs_list=imgs_all_val,
+            preds_list=preds_all_val,
+            truths_list=truths_all_val,
+            raws_list=raws_all_val,
+            lens_list=lens_all_val,
+        )
         # append metrics to CSV
         with open(metrics_csv, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(
