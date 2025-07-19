@@ -240,6 +240,7 @@ def validate_greedy(
     loader,
     criterion_ctc,
     alphabet,
+    alphabet_only,
     alpha,
     device,
     writer,
@@ -284,14 +285,16 @@ def run_training(config):
     set_seed(config.seed)
     # ensure checkpoint directory exists
     os.makedirs(config.checkpoint_dir, exist_ok=True)
-    set_seed(config.seed)
+
+    # build alphabet
     paths = config.train_csvs + config.val_csvs
     alphabet = build_alphabet(
         paths,
         min_char_freq=config.min_char_freq,
-        case_insensitive=config.case_insensitive,
+        case_insensitive=getattr(config, "case_insensitive", False),
     )
 
+    # dataloaders
     train_loader, val_loader = create_dataloaders(
         config.train_csvs,
         config.train_roots,
@@ -303,29 +306,43 @@ def run_training(config):
         config.batch_size,
     )
 
+    # device and model
     device = torch.device(config.device)
     model, crit_ctc, crit_attn = init_model(
         config.img_height, config.img_max_width, alphabet, device
     )
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
+    # scheduler based on default LM alpha
     scheduler = lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=2
     )
 
+    # tensorboard writer
     writer = SummaryWriter(log_dir=config.log_dir)
+    # load LM
     lm_model = CharNGramLM.load(config.lm_path)
 
-    best_beam_loss = float("inf")
-    best_greedy_loss = float("inf")
-
-    # prepare metrics files
-    metrics_beam = os.path.join(config.checkpoint_dir, "metrics_beam.csv")
-    metrics_greedy = os.path.join(config.checkpoint_dir, "metrics_greedy.csv")
-    for fpath in (metrics_beam, metrics_greedy):
+    # Prepare multiple LM alphas for beam validation
+    lm_alphas = getattr(config, "lm_alphas", [config.lm_alpha])
+    # Best losses and metrics paths per alpha
+    best_beam_losses = {a: float("inf") for a in lm_alphas}
+    metrics_beam_files = {
+        a: os.path.join(config.checkpoint_dir, f"metrics_beam_alpha{a}.csv")
+        for a in lm_alphas
+    }
+    for fpath in metrics_beam_files.values():
         with open(fpath, "w", newline="", encoding="utf-8") as f:
-            f.write("epoch,loss,acc,CER,WER\n")
+            f.write("epoch,loss,acc,CER,WER")
 
+    # Greedy metrics
+    best_greedy_loss = float("inf")
+    metrics_greedy = os.path.join(config.checkpoint_dir, "metrics_greedy.csv")
+    with open(metrics_greedy, "w", newline="", encoding="utf-8") as f:
+        f.write("epoch,loss,acc,CER,WER")
+
+    # Training loop
     for epoch in range(1, config.epochs + 1):
+        # Train
         train_loss, train_acc, train_cer, train_wer = train_one_epoch(
             model,
             train_loader,
@@ -340,21 +357,35 @@ def run_training(config):
             config.alpha,
         )
 
-        # beam+LM validation
-        beam_loss, beam_acc, beam_cer, beam_wer = validate_beam(
-            model,
-            val_loader,
-            crit_ctc,
-            crit_attn,
-            alphabet,
-            lm_model,
-            config.alpha,
-            config.lm_alpha,
-            device,
-            writer,
-            epoch,
-        )
-        # greedy-only validation
+        # Beam+LM validations for each alpha
+        beam_results = {}
+        for a in lm_alphas:
+            loss_b, acc_b, cer_b, wer_b = validate_beam(
+                model,
+                val_loader,
+                crit_ctc,
+                crit_attn,
+                alphabet,
+                lm_model,
+                config.alpha,
+                a,
+                device,
+                writer,
+                epoch,
+            )
+            # record
+            beam_results[a] = (loss_b, acc_b)
+            with open(metrics_beam_files[a], "a", newline="", encoding="utf-8") as f:
+                f.write(f"{epoch},{loss_b:.6f},{acc_b:.6f},{cer_b:.6f},{wer_b:.6f}")
+            # save best
+            if loss_b < best_beam_losses[a]:
+                best_beam_losses[a] = loss_b
+                torch.save(
+                    model.state_dict(),
+                    os.path.join(config.checkpoint_dir, f"best_beam_alpha{a}.pth"),
+                )
+
+        # Greedy validation
         greedy_loss, greedy_acc, greedy_cer, greedy_wer = validate_greedy(
             model,
             val_loader,
@@ -365,32 +396,9 @@ def run_training(config):
             writer,
             epoch,
         )
-
-        # scheduler on beam loss
-        scheduler.step(beam_loss)
-
-        # save metrics histories
-        with open(metrics_beam, "a", newline="", encoding="utf-8") as f:
-            f.write(
-                f"{epoch},{beam_loss:.6f},{beam_acc:.6f},{beam_cer:.6f},{beam_wer:.6f}\n"
-            )
         with open(metrics_greedy, "a", newline="", encoding="utf-8") as f:
             f.write(
-                f"{epoch},{greedy_loss:.6f},{greedy_acc:.6f},{greedy_cer:.6f},{greedy_wer:.6f}\n"
-            )
-
-        print(
-            f"Epoch {epoch}/{config.epochs} | "
-            f"Train L={train_loss:.4f} Acc={train_acc:.4f} | "
-            f"Beam L={beam_loss:.4f} Acc={beam_acc:.4f} | "
-            f"Greedy L={greedy_loss:.4f} Acc={greedy_acc:.4f}"
-        )
-
-        # save best weights separately
-        if beam_loss < best_beam_loss:
-            best_beam_loss = beam_loss
-            torch.save(
-                model.state_dict(), os.path.join(config.checkpoint_dir, "best_beam.pth")
+                f"{epoch},{greedy_loss:.6f},{greedy_acc:.6f},{greedy_cer:.6f},{greedy_wer:.6f}"
             )
         if greedy_loss < best_greedy_loss:
             best_greedy_loss = greedy_loss
@@ -398,6 +406,16 @@ def run_training(config):
                 model.state_dict(),
                 os.path.join(config.checkpoint_dir, "best_greedy.pth"),
             )
+
+        # Scheduler step on default LM alpha (first)
+        scheduler.step(beam_results[lm_alphas[0]][0])
+
+        # Console log
+        stats = [f"Train L={train_loss:.4f} Acc={train_acc:.4f}"]
+        for a, (lb, ab) in beam_results.items():
+            stats.append(f"Beam@{a} L={lb:.4f} Acc={ab:.4f}")
+        stats.append(f"Greedy L={greedy_loss:.4f} Acc={greedy_acc:.4f}")
+        print(f"Epoch {epoch}/{config.epochs} | " + " | ".join(stats))
 
     writer.close()
 
@@ -407,10 +425,10 @@ if __name__ == "__main__":
 
     config = Namespace(
         seed=42,
-        train_csvs=[r"C:\data_19_04\Archive_19_04\data_hkr\gt_train.txt"],
-        train_roots=[r"C:\data_19_04\Archive_19_04\data_hkr\train"],
-        val_csvs=[r"C:\data_19_04\Archive_19_04\data_hkr\gt_test.txt"],
-        val_roots=[r"C:\data_19_04\Archive_19_04\data_hkr\test"],
+        train_csvs=[r"C:\shared\Archive_19_04\data_hkr\gt_train.txt"],
+        train_roots=[r"C:\shared\Archive_19_04\data_hkr\train"],
+        val_csvs=[r"C:\shared\Archive_19_04\data_hkr\gt_test.txt"],
+        val_roots=[r"C:\shared\Archive_19_04\data_hkr\test"],
         img_height=60,
         img_max_width=240,
         batch_size=48,
@@ -419,11 +437,11 @@ if __name__ == "__main__":
         alpha=0.3,
         decode_train="greedy",
         lm_alpha=0.5,
+        lm_alphas=[0.3, 0.5, 0.7],
         lm_path="char6gram.pkl",
         device="cuda" if torch.cuda.is_available() else "cpu",
         log_dir="runs/exp",
         checkpoint_dir="checkpoints/exp_1",
         min_char_freq=30,
-        case_insensitive=True,
     )
     run_training(config)
