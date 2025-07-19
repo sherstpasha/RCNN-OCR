@@ -8,13 +8,14 @@ import pickle
 
 
 class CharNGramLM:
-    def __init__(self, N: int, alpha: float = 1.0):
+    def __init__(self, N: int, alpha: float = 1.0, case_insensitive: bool = False):
         """
         N     — порядок модели (например, 6 для 6‑грамм)
         alpha — параметр сглаживания (1.0 = add‑1)
         """
         self.N = N
         self.alpha = alpha
+        self.case_insensitive = case_insensitive
         # counts[n-1][gram] = число вхождений n‑граммы
         self.counts = [Counter() for _ in range(N)]
         # context_counts[n-1][prefix] = число вхождений (n‑1)‑грамм, т.е. «контекста»
@@ -24,6 +25,8 @@ class CharNGramLM:
     def train(self, words: list[str]):
         """Считает все n‑граммы по списку словоформ."""
         for w in words:
+            if self.case_insensitive:
+                w = w.lower()
             chars = list(w.strip())
             for i, c in enumerate(chars):
                 self.vocab.add(c)
@@ -38,6 +41,8 @@ class CharNGramLM:
 
     def log_prob(self, word: str) -> float:
         """Возвращает log‑вероятность целого слова как сумму условных вероятностей."""
+        if self.case_insensitive:
+            word = word.lower()
         chars = list(word.strip())
         V = len(self.vocab)
         logp = 0.0
