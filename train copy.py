@@ -84,7 +84,14 @@ def create_dataloaders(
     return train_loader, val_loader
 
 
-def init_model(img_height, img_max_width, alphabet, device, pretrained=False):
+def init_model(
+    img_height,
+    img_max_width,
+    alphabet,
+    device,
+    pretrained=False,
+    freeze_cnn_layers=None,
+):
     num_ctc = 1 + len(alphabet)
     num_attn = len(SPECIAL_TOKENS) + len(alphabet)
     model = CRNN(
@@ -93,7 +100,8 @@ def init_model(img_height, img_max_width, alphabet, device, pretrained=False):
         num_ctc_classes=num_ctc,
         num_attn_classes=num_attn,
         pretrained=pretrained,
-        backbone="resnet",
+        backbone="msfresnet",
+        freeze_cnn_layers=freeze_cnn_layers,
     ).to(device)
     criterion_ctc = nn.CTCLoss(blank=0, zero_infinity=True)
     criterion_attn = nn.CrossEntropyLoss(ignore_index=0)
@@ -151,6 +159,19 @@ def train_one_epoch(
             offset += L
             refs.append("".join(alphabet[i - 1] for i in seq if i > 0))
         hyps.extend(preds)
+
+        import random
+
+        n = min(10, len(refs))
+        sample_idxs = random.sample(range(len(refs)), n)
+        print("\n=== Sample Greedy Validation Results ===")
+        print(f"{'#':<3} {'Reference':<30} {'Prediction':<30} {'OK'}")
+        for i in sample_idxs:
+            ref = refs[i]
+            hyp = hyps[i]
+            ok = "✔" if ref == hyp else "✘"
+            print(f"{i:<3} {ref:<30} {hyp:<30} {ok}")
+        print("=== end samples ===\n")
 
         writer.add_scalar("train/loss_iter", loss.item(), global_step=step)
         step += 1
@@ -220,6 +241,19 @@ def validate_beam(
                 refs.append("".join(alphabet[i - 1] for i in seq if i > 0))
             hyps.extend(preds)
 
+            import random
+
+            n = min(10, len(refs))
+            sample_idxs = random.sample(range(len(refs)), n)
+            print("\n=== Sample Greedy Validation Results ===")
+            print(f"{'#':<3} {'Reference':<30} {'Prediction':<30} {'OK'}")
+            for i in sample_idxs:
+                ref = refs[i]
+                hyp = hyps[i]
+                ok = "✔" if ref == hyp else "✘"
+                print(f"{i:<3} {ref:<30} {hyp:<30} {ok}")
+            print("=== end samples ===\n")
+
     avg_loss = alpha * (total_ctc / len(loader)) + (1 - alpha) * (
         total_attn / len(loader)
     )
@@ -240,7 +274,6 @@ def validate_greedy(
     loader,
     criterion_ctc,
     alphabet,
-    alphabet_only,
     alpha,
     device,
     writer,
@@ -270,6 +303,19 @@ def validate_greedy(
                 offset += L
                 refs.append("".join(alphabet[i - 1] for i in seq if i > 0))
             hyps.extend(preds)
+
+            import random
+
+            n = min(10, len(refs))
+            sample_idxs = random.sample(range(len(refs)), n)
+            print("\n=== Sample Greedy Validation Results ===")
+            print(f"{'#':<3} {'Reference':<30} {'Prediction':<30} {'OK'}")
+            for i in sample_idxs:
+                ref = refs[i]
+                hyp = hyps[i]
+                ok = "✔" if ref == hyp else "✘"
+                print(f"{i:<3} {ref:<30} {hyp:<30} {ok}")
+            print("=== end samples ===\n")
     avg_loss = alpha * (total_ctc / len(loader))
     acc = compute_accuracy(refs, hyps)
     cer = sum(character_error_rate(r, h) for r, h in zip(refs, hyps)) / len(refs)
@@ -309,9 +355,20 @@ def run_training(config):
     # device and model
     device = torch.device(config.device)
     model, crit_ctc, crit_attn = init_model(
-        config.img_height, config.img_max_width, alphabet, device
+        config.img_height,
+        config.img_max_width,
+        alphabet,
+        device,
+        pretrained=True,
+        freeze_cnn_layers=getattr(config, "freeze_cnn_layers", None),
     )
-    optimizer = optim.Adam(model.parameters(), lr=config.lr)
+    n_total = sum(p.numel() for p in model.parameters())
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters:     {n_total:,}")
+    print(f"Trainable parameters: {n_trainable:,}")
+    optimizer = optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), lr=config.lr
+    )
     # scheduler based on default LM alpha
     scheduler = lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=2
@@ -425,10 +482,10 @@ if __name__ == "__main__":
 
     config = Namespace(
         seed=42,
-        train_csvs=[r"C:\shared\Archive_19_04\data_hkr\gt_train.txt"],
-        train_roots=[r"C:\shared\Archive_19_04\data_hkr\train"],
-        val_csvs=[r"C:\shared\Archive_19_04\data_hkr\gt_test.txt"],
-        val_roots=[r"C:\shared\Archive_19_04\data_hkr\test"],
+        train_csvs=[r"C:\shared\Archive_19_04\data_archive\gt_train.txt"],
+        train_roots=[r"C:\shared\Archive_19_04\data_archive"],
+        val_csvs=[r"C:\shared\Archive_19_04\data_archive\gt_test.txt"],
+        val_roots=[r"C:\shared\Archive_19_04\data_archive"],
         img_height=60,
         img_max_width=240,
         batch_size=48,
@@ -436,12 +493,20 @@ if __name__ == "__main__":
         lr=1e-3,
         alpha=0.3,
         decode_train="greedy",
-        lm_alpha=0.5,
-        lm_alphas=[0.3, 0.5, 0.7],
+        lm_alpha=0.3,
         lm_path="char6gram.pkl",
         device="cuda" if torch.cuda.is_available() else "cpu",
         log_dir="runs/exp",
         checkpoint_dir="checkpoints/exp_1",
         min_char_freq=30,
+        case_insensitive=True,
+        freeze_cnn_layers=[
+            "scaleA.0",  # conv1
+            "scaleA.4",  # layer1
+            "scaleA.5",  # layer2
+            "scaleB.0",  # conv1
+            "scaleB.4",  # layer1
+            "scaleB.5",  # layer2
+        ],
     )
     run_training(config)

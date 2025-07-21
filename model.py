@@ -83,6 +83,62 @@ class TPS_STN(nn.Module):
         return warp_image_tps(x, src_pts, kernel_w, affine_w, align_corners=True)
 
 
+class MSFResNet(nn.Module):
+    def __init__(self, pretrained=True):
+        super().__init__()
+
+        # --- Scale A --- (без maxpool)
+        resnet_a = models.resnet18(
+            weights=ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+        )
+        resnet_a.maxpool = nn.Identity()
+        self.scaleA = nn.Sequential(*list(resnet_a.children())[:-2])
+
+        # --- Scale B --- (обычная, с maxpool)
+        resnet_b = models.resnet18(
+            weights=ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+        )
+        self.scaleB = nn.Sequential(*list(resnet_b.children())[:-2])
+
+        # Преобразуем входные conv1, чтобы принять grayscale
+        for net in [self.scaleA, self.scaleB]:
+            conv1 = net[0]
+            new_conv = nn.Conv2d(
+                1,
+                conv1.out_channels,
+                kernel_size=conv1.kernel_size,
+                stride=(1, 1),
+                padding=conv1.padding,
+                bias=False,
+            )
+            if pretrained:
+                with torch.no_grad():
+                    new_conv.weight[:] = conv1.weight.sum(dim=1, keepdim=True)
+            net[0] = new_conv
+
+    def freeze_layers(self, layer_names: list[str]):
+        for lname in layer_names:
+            module = self
+            for part in lname.split("."):
+                module = getattr(module, part, None)
+                if module is None:
+                    break
+            if isinstance(module, nn.Module):
+                for param in module.parameters():
+                    param.requires_grad = False
+
+    def forward(self, x):
+        fA = self.scaleA(x)  # меньше downsampling
+        fB = self.scaleB(x)  # обычный путь
+
+        if fA.shape[2:] != fB.shape[2:]:
+            fB = F.interpolate(
+                fB, size=fA.shape[2:], mode="bilinear", align_corners=False
+            )
+
+        return fA + fB  # или torch.cat([fA, fB], dim=1) если нужно больше признаков
+
+
 class VGG_FeatureExtractor(nn.Module):
     """VGG-style из оригинального CRNN (Shi et al. 2016)"""
 
@@ -132,6 +188,7 @@ class CRNN(nn.Module):
         backbone: str = "resnet",
         pretrained: bool = True,
         transform: str = "none",
+        freeze_cnn_layers: list[str] = None,
     ):
         super().__init__()
         # STN
@@ -161,11 +218,26 @@ class CRNN(nn.Module):
             net.maxpool = nn.Identity()
             self.cnn = nn.Sequential(*list(net.children())[:-2])
             cnn_out = 512
+
+        elif backbone == "msfresnet":
+            self.cnn = MSFResNet(pretrained=pretrained)
+            cnn_out = 512  # если используете add; если concat — поставьте 1024
+
         elif backbone == "vgg":
             self.cnn = VGG_FeatureExtractor(in_ch=1, out_ch=512)
             cnn_out = 512
+
         else:
             raise ValueError(f"Unsupported backbone '{backbone}'")
+
+        if freeze_cnn_layers:
+            if backbone == "msfresnet" and hasattr(self.cnn, "freeze_layers"):
+                self.cnn.freeze_layers(freeze_cnn_layers)
+            else:
+                for name, module in self.cnn.named_children():
+                    if name in freeze_cnn_layers:
+                        for param in module.parameters():
+                            param.requires_grad = False
 
         self.adaptive_pool = nn.AdaptiveAvgPool2d((1, None))
         # RNN-энкодер
@@ -191,6 +263,19 @@ class CRNN(nn.Module):
         self.attn_v = nn.Linear(256 * 2, 256)
         self.attn_out = nn.Linear(256, 256)
         self.decoder_fc = nn.Linear(256, num_attn_classes)
+
+    def freeze_layers(self, layer_names: list[str]):
+        for lname in layer_names:
+            if not hasattr(self, lname.split(".")[0]):
+                continue
+            module = self
+            for part in lname.split("."):
+                module = getattr(module, part, None)
+                if module is None:
+                    break
+            if isinstance(module, nn.Module):
+                for p in module.parameters():
+                    p.requires_grad = False
 
     def forward(self, x, decoder_inputs=None):
         if self.stn is not None:
