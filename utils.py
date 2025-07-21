@@ -1,7 +1,7 @@
 # utils.py
 
 import torch
-from model import CRNN
+from model import TRBA
 
 
 def load_crnn(
@@ -11,9 +11,9 @@ def load_crnn(
     device: torch.device = None,
     pretrained: bool = False,
     transform: str = "none",
-) -> CRNN:
+) -> TRBA:
     """
-    Создаёт CRNN с опциональным STN/TPS, загружает веса из checkpoint и переводит сеть в eval-режим.
+    Создаёт TRBA с опциональным STN/TPS, загружает веса из checkpoint и переводит сеть в eval-режим.
 
     Args:
         checkpoint_path: путь к файлу state_dict
@@ -25,7 +25,7 @@ def load_crnn(
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = CRNN(
+    model = TRBA(
         img_height, num_classes, pretrained=pretrained, transform=transform
     ).to(device)
     state = torch.load(checkpoint_path, map_location=device)

@@ -1,11 +1,38 @@
-# model.py
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.models as models
-from torchvision.models import ResNet18_Weights
 from kornia.geometry.transform import get_tps_transform, warp_image_tps
+from torch import Tensor
+from typing import Optional
+
+
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super().__init__()
+        self.conv1 = nn.Conv2d(
+            inplanes, planes, kernel_size=3, stride=stride, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(
+            planes, planes, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.downsample = downsample
+
+    def forward(self, x: Tensor) -> Tensor:
+        identity = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        out += identity
+        out = self.relu(out)
+        return out
 
 
 def build_fiducial_points(num_fiducial: int) -> torch.Tensor:
@@ -14,37 +41,124 @@ def build_fiducial_points(num_fiducial: int) -> torch.Tensor:
     xs = torch.linspace(-1.0, 1.0, steps=half)
     top = torch.stack([xs, torch.full_like(xs, -1.0)], dim=1)
     bot = torch.stack([xs, torch.full_like(xs, +1.0)], dim=1)
-    return torch.cat([top, bot], dim=0)  # [K,2]
+    return torch.cat([top, bot], dim=0)
 
 
-class AffineSTN(nn.Module):
-    """Аффинный Spatial Transformer"""
+class ResNet(nn.Module):
+    """Full ResNet implementation for OCR (uses BasicBlock)."""
 
-    def __init__(self):
+    def __init__(
+        self, input_channel: int, output_channel: int, block, layers: list[int]
+    ):
         super().__init__()
-        self.loc_net = nn.Sequential(
-            nn.Conv2d(1, 8, 7),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(8, 10, 5),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2),
-            nn.AdaptiveAvgPool2d((3, 3)),
-            nn.Flatten(),
-            nn.Linear(10 * 3 * 3, 32),
-            nn.ReLU(),
-            nn.Linear(32, 6),
+        self.output_channel_block = [
+            output_channel // 4,
+            output_channel // 2,
+            output_channel,
+            output_channel,
+        ]
+        self.inplanes = output_channel // 8
+        # initial conv layers
+        self.conv0_1 = nn.Conv2d(
+            input_channel, output_channel // 16, 3, 1, 1, bias=False
         )
-        # инициализация bias под identity
-        self.loc_net[-1].weight.data.zero_()
-        self.loc_net[-1].bias.data.copy_(
-            torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float)
+        self.bn0_1 = nn.BatchNorm2d(output_channel // 16)
+        self.conv0_2 = nn.Conv2d(
+            output_channel // 16, self.inplanes, 3, 1, 1, bias=False
         )
+        self.bn0_2 = nn.BatchNorm2d(self.inplanes)
+        self.relu = nn.ReLU(inplace=True)
+        # stage1
+        self.maxpool1 = nn.MaxPool2d(2, 2)
+        self.layer1 = self._make_layer(block, self.output_channel_block[0], layers[0])
+        self.conv1 = nn.Conv2d(
+            self.output_channel_block[0],
+            self.output_channel_block[0],
+            3,
+            1,
+            1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(self.output_channel_block[0])
+        # stage2
+        self.maxpool2 = nn.MaxPool2d(2, 2)
+        self.layer2 = self._make_layer(
+            block, self.output_channel_block[1], layers[1], stride=1
+        )
+        self.conv2 = nn.Conv2d(
+            self.output_channel_block[1],
+            self.output_channel_block[1],
+            3,
+            1,
+            1,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(self.output_channel_block[1])
+        # stage3
+        self.maxpool3 = nn.MaxPool2d((2, 1), (2, 1), padding=(0, 0))
+        self.layer3 = self._make_layer(
+            block, self.output_channel_block[2], layers[2], stride=1
+        )
+        self.conv3 = nn.Conv2d(
+            self.output_channel_block[2],
+            self.output_channel_block[2],
+            3,
+            1,
+            1,
+            bias=False,
+        )
+        self.bn3 = nn.BatchNorm2d(self.output_channel_block[2])
+        # stage4
+        self.layer4 = self._make_layer(
+            block, self.output_channel_block[3], layers[3], stride=1
+        )
+        self.conv4_1 = nn.Conv2d(
+            self.output_channel_block[3],
+            self.output_channel_block[3],
+            2,
+            (2, 1),
+            (0, 1),
+            bias=False,
+        )
+        self.bn4_1 = nn.BatchNorm2d(self.output_channel_block[3])
+        self.conv4_2 = nn.Conv2d(
+            self.output_channel_block[3],
+            self.output_channel_block[3],
+            2,
+            1,
+            0,
+            bias=False,
+        )
+        self.bn4_2 = nn.BatchNorm2d(self.output_channel_block[3])
 
-    def forward(self, x):
-        theta = self.loc_net(x).view(-1, 2, 3)
-        grid = F.affine_grid(theta, x.size(), align_corners=False)
-        return F.grid_sample(x, grid, align_corners=False)
+    def _make_layer(self, block, planes: int, blocks: int, stride: int = 1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(
+                    self.inplanes, planes * block.expansion, 1, stride, bias=False
+                ),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+        layers = [block(self.inplanes, planes, stride, downsample)]
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+        return nn.Sequential(*layers)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.relu(self.bn0_1(self.conv0_1(x)))
+        x = self.relu(self.bn0_2(self.conv0_2(x)))
+        x = self.maxpool1(x)
+        x = self.relu(self.bn1(self.conv1(self.layer1(x))))
+        x = self.maxpool2(x)
+        x = self.relu(self.bn2(self.conv2(self.layer2(x))))
+        x = self.maxpool3(x)
+        x = self.relu(self.bn3(self.conv3(self.layer3(x))))
+        x = self.layer4(x)
+        x = self.relu(self.bn4_1(self.conv4_1(x)))
+        x = self.relu(self.bn4_2(self.conv4_2(x)))
+        return x
 
 
 class TPS_STN(nn.Module):
@@ -76,52 +190,18 @@ class TPS_STN(nn.Module):
         nn.init.zeros_(fc.weight)
         fc.bias.data.copy_(ctrl.view(-1))
 
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
         B, C, H, W = x.shape
-        src_pts = self.loc_net(x).view(B, self.num_fiducial, 2)
+        delta = self.loc_net(x).view(B, self.num_fiducial, 2) * 0.1
         dst_pts = self.target_control_points.unsqueeze(0).expand(B, -1, -1)
+        src_pts = dst_pts + delta
         kernel_w, affine_w = get_tps_transform(src_pts, dst_pts)
         return warp_image_tps(x, src_pts, kernel_w, affine_w, align_corners=True)
 
 
-class VGG_FeatureExtractor(nn.Module):
-    """VGG-style из оригинального CRNN (Shi et al. 2016)"""
-
-    def __init__(self, in_ch=1, out_ch=512):
-        super().__init__()
-        oc = [out_ch // 8, out_ch // 4, out_ch // 2, out_ch]  # [64,128,256,512]
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, oc[0], 3, 1, 1),
-            nn.ReLU(True),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(oc[0], oc[1], 3, 1, 1),
-            nn.ReLU(True),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(oc[1], oc[2], 3, 1, 1),
-            nn.ReLU(True),
-            nn.Conv2d(oc[2], oc[2], 3, 1, 1),
-            nn.ReLU(True),
-            nn.MaxPool2d((2, 1), (2, 1)),
-            nn.Conv2d(oc[2], oc[3], 3, 1, 1, bias=False),
-            nn.BatchNorm2d(oc[3]),
-            nn.ReLU(True),
-            nn.Conv2d(oc[3], oc[3], 3, 1, 1, bias=False),
-            nn.BatchNorm2d(oc[3]),
-            nn.ReLU(True),
-            nn.MaxPool2d((2, 1), (2, 1)),
-            nn.Conv2d(oc[3], oc[3], 2, 1, 0),
-            nn.ReLU(True),
-        )
-
-    def forward(self, x):
-        return self.conv(x)
-
-
-class CRNN(nn.Module):
+class TRBA(nn.Module):
     """
-    CRNN с опциями:
-      - backbone: 'resnet' (ResNet-18) или 'vgg'
-      - transform: 'none'|'affine'|'tps'
+    TRBA OCR model with ResNet backbone and optional TPS STN
     """
 
     def __init__(
@@ -129,79 +209,35 @@ class CRNN(nn.Module):
         img_height: int,
         img_width: int,
         num_classes: int,
-        backbone: str = "resnet",
-        pretrained: bool = True,
-        transform: str = "none",
+        transform: Optional[str] = None,
     ):
         super().__init__()
-        self.img_height = img_height
-        self.img_width = img_width
+        # Spatial transformer
+        self.stn = TPS_STN(20, img_height, img_width) if transform == "tps" else None
+        # ResNet backbone from FAN paper
 
-        # Spatial Transformer
-        if transform == "affine":
-            self.stn = AffineSTN()
-        elif transform == "tps":
-            self.stn = TPS_STN(20, img_height, img_width)
-        else:
-            self.stn = None
-
-        # Выбираем фиче-экстрактор
-        if backbone == "resnet":
-            weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
-            net = models.resnet18(weights=weights)
-            # первый conv → 1-канал, stride=(1,1)
-            orig = net.conv1
-            net.conv1 = nn.Conv2d(
-                1,
-                orig.out_channels,
-                kernel_size=orig.kernel_size,
-                stride=(1, 1),
-                padding=orig.padding,
-                bias=False,
-            )
-            if pretrained:
-                with torch.no_grad():
-                    net.conv1.weight[:] = orig.weight.sum(dim=1, keepdim=True)
-            # убираем агрессивный пул
-            net.maxpool = nn.Identity()
-            self.cnn = nn.Sequential(*list(net.children())[:-2])
-            cnn_out = 512
-
-        elif backbone == "vgg":
-            self.cnn = VGG_FeatureExtractor(in_ch=1, out_ch=512)
-            cnn_out = 512
-
-        else:
-            raise ValueError(f"Unsupported backbone '{backbone}'")
-
-        # Свёртки → AdaptiveAvgPool2d((1,None)) оставляет только размер по ширине W'
+        self.cnn = ResNet(1, 512, BasicBlock, [1, 2, 5, 3])
+        cnn_out = 512
+        # Pool height
         self.adaptive_pool = nn.AdaptiveAvgPool2d((1, None))
-
-        # RNN-блок
+        # LSTM sequence modeling
         self.rnn = nn.LSTM(
-            input_size=cnn_out,
-            hidden_size=256,
-            num_layers=2,
-            bidirectional=True,
-            dropout=0.3,
-            batch_first=True,
+            cnn_out, 256, 2, bidirectional=True, dropout=0.3, batch_first=True
         )
-        self.layer_norm = nn.LayerNorm(256 * 2)
-        self.dropout_rnn = nn.Dropout(0.3)
+        self.layer_norm = nn.LayerNorm(512)
+        self.dropout = nn.Dropout(0.3)
+        # Classifier
+        self.embedding = nn.Linear(512, num_classes)
 
-        # классификатор
-        self.embedding = nn.Linear(256 * 2, num_classes)
-
-    def forward(self, x):
-        # x: [B,1,H,W]
+    def forward(self, x: Tensor) -> Tensor:
         if self.stn is not None:
             x = self.stn(x)
-        f = self.cnn(x)  # [B,C,H',W']
-        f = self.adaptive_pool(f)  # [B,C,1,W']
+        f = self.cnn(x)
+        f = self.adaptive_pool(f)
         B, C, _, Wp = f.shape
-        f = f.view(B, C, Wp).permute(0, 2, 1)  # [B, W', C]
-        r, _ = self.rnn(f)  # [B, W', 512]
+        f = f.view(B, C, Wp).permute(0, 2, 1)
+        r, _ = self.rnn(f)
         r = self.layer_norm(r)
-        r = self.dropout_rnn(r)
-        o = self.embedding(r)  # [B, W', classes]
-        return o.permute(1, 0, 2)  # [W',B,classes]
+        r = self.dropout(r)
+        o = self.embedding(r)
+        return o.permute(1, 0, 2)

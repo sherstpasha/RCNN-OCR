@@ -89,17 +89,17 @@ if __name__ == "__main__":
     img_height, img_max_width = 60, 240
 
     train_csvs = [
-        r"C:\data_cyrillic\gt_train.txt",
+        r"C:\shared\Archive_19_04\data_archive\gt_train.txt",
     ]
     train_image_roots = [
-        r"C:\data_cyrillic\train",
+        r"C:\shared\Archive_19_04\data_archive",
     ]
 
     val_csvs = [
-        r"C:\data_cyrillic\gt_test.txt",
+        r"C:\shared\Archive_19_04\data_archive\gt_test.txt",
     ]
     val_image_roots = [
-        r"C:\data_cyrillic\test",
+        r"C:\shared\Archive_19_04\data_archive",
     ]
 
     # Запустить визуализацию TRAIN
@@ -109,7 +109,7 @@ if __name__ == "__main__":
         img_height=img_height,
         img_max_width=img_max_width,
         batch_size=16,
-        n_batches=10,
+        n_batches=3,
         min_char_freq=1,
         augment=True,
     )

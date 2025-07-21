@@ -22,7 +22,7 @@ from torch.optim import lr_scheduler
 import matplotlib.pyplot as plt
 
 from dataset import OCRDataset
-from model import CRNN
+from model import TRBA
 from utils import ctc_greedy_decoder
 from metrics import character_error_rate, word_error_rate, compute_accuracy
 
@@ -71,10 +71,19 @@ batch_size, epochs = 16 * 8, 40
 learning_rate = 1e-3
 
 # 4) Data annotation files and their image roots
-train_csvs = [r"C:\data_cyrillic\gt_train.txt"]
-train_image_roots = [r"C:\data_cyrillic\train"]
-val_csvs = [r"C:\data_cyrillic\gt_test.txt"]
-val_image_roots = [r"C:\data_cyrillic\test"]
+train_csvs = [
+    r"C:\shared\Archive_19_04\data_archive\gt_train.txt",
+]
+train_image_roots = [
+    r"C:\shared\Archive_19_04\data_archive",
+]
+
+val_csvs = [
+    r"C:\shared\Archive_19_04\data_archive\gt_test.txt",
+]
+val_image_roots = [
+    r"C:\shared\Archive_19_04\data_archive",
+]
 
 # 5) Build alphabet from all CSVs, filtering rare chars
 alphabet = OCRDataset.build_alphabet(
@@ -95,7 +104,7 @@ for csv_path, img_root in zip(train_csvs, train_image_roots):
             img_height=img_height,
             img_max_width=img_max_width,
             min_char_freq=1,
-            augment=False,  # аугментации включены в трейне
+            augment=True,  # аугментации включены в трейне
         )
     )
 
@@ -125,13 +134,13 @@ val_loader = DataLoader(
 # 7) Model, loss, optimizer, scheduler
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
-model = CRNN(
+model = TRBA(
     img_height,
     img_max_width,
     num_classes,
     pretrained=False,
-    transform="none",
-    backbone="vgg",  # или "resnet18"
+    transform=None,
+    backbone="convnextv2",  # или "resnet18"
 ).to(device)
 
 criterion = nn.CTCLoss(blank=0, zero_infinity=True)
