@@ -57,11 +57,11 @@ def create_dataloaders(
     prefetch_factor=2,
 ):
     train_sets = [
-        OCRDataset(c, r, alphabet, img_h, img_w, augment=True)
+        OCRDataset(c, r, alphabet, img_h, img_w, augment=True, ignore_case=True)
         for c, r in zip(train_csvs, train_roots)
     ]
     val_sets = [
-        OCRDataset(c, r, alphabet, img_h, img_w, augment=False)
+        OCRDataset(c, r, alphabet, img_h, img_w, augment=False, ignore_case=True)
         for c, r in zip(val_csvs, val_roots)
     ]
     train_loader = DataLoader(
@@ -115,7 +115,9 @@ def train_epoch(
     model.train()
     loss_sum = 0.0
     refs, hyps = [], []
+    step = (epoch - 1) * len(loader)
     for imgs, labs, _, lab_lens in tqdm(loader, desc=f"Train {epoch}"):
+        step += 1
         imgs, labs = imgs.to(device), labs.to(device)
         lab_lens = lab_lens.to(device)
         optimizer.zero_grad()
@@ -128,7 +130,7 @@ def train_epoch(
         scaler.step(optimizer)
         scaler.update()
         loss_sum += loss.item()
-        writer.add_scalar("train/loss_step", loss.item(), epoch * len(loader))
+        writer.add_scalar("train/loss_step", loss.item(), step)
         preds, raws = ctc_greedy_decoder(out, alphabet)
         offset = 0
         for L in lab_lens.tolist():
@@ -167,7 +169,7 @@ def validate_epoch(model, loader, criterion, device, writer, epoch, alphabet):
                 seq = labs[offset : offset + L].tolist()
                 offset += L
                 refs.append("".join(alphabet[i - 1] for i in seq if i > 0))
-        hyps.extend(preds)
+            hyps.extend(preds)
     avg_loss = loss_sum / len(loader)
     acc = compute_accuracy(refs, hyps)
     cer = sum(character_error_rate(r, h) for r, h in zip(refs, hyps)) / len(refs)
@@ -182,15 +184,38 @@ def validate_epoch(model, loader, criterion, device, writer, epoch, alphabet):
 def main(use_profiler=False):
     set_seed(42)
     # dataset paths
-    train_csvs = [r"C:\shared\Archive_19_04\data_archive\gt_train.txt"]
-    train_roots = [r"C:\shared\Archive_19_04\data_archive"]
-    val_csvs = [r"C:\shared\Archive_19_04\data_archive\gt_test.txt"]
-    val_roots = [r"C:\shared\Archive_19_04\data_archive"]
-
+    train_csvs = [
+        r"C:\shared\Archive_19_04\data_archive\gt_train.txt",
+                   r"C:\shared\Archive_19_04\data_cyrillic\gt_train.txt",
+                     r"C:\shared\Archive_19_04\data_hkr\gt_train.txt",
+                     r"C:\shared\Archive_19_04\data_school\gt_train.txt",
+                     r"C:\shared\Archive_19_04\foreverschool_notebooks_RU\train.csv"
+                     ]
+    train_roots = [
+        r"C:\shared\Archive_19_04\data_archive",
+                    r"C:\shared\Archive_19_04\data_cyrillic\train",
+                      r"C:\shared\Archive_19_04\data_hkr\train",
+                      r"C:\shared\Archive_19_04\data_school",
+                      r"C:\shared\Archive_19_04\foreverschool_notebooks_RU\train"
+                      ]
+    val_csvs = [
+        r"C:\shared\Archive_19_04\data_archive\gt_test.txt",
+#                 r"C:\shared\Archive_19_04\data_cyrillic\gt_test.txt",
+#                 r"C:\shared\Archive_19_04\data_hkr\gt_test.txt",
+#                 r"C:\shared\Archive_19_04\data_school\gt_test.txt",
+#                 r"C:\shared\Archive_19_04\foreverschool_notebooks_RU\val.csv"
+                 ]
+    val_roots = [
+        r"C:\shared\Archive_19_04\data_archive",
+#                  r"C:\shared\Archive_19_04\data_cyrillic\test",
+#                    r"C:\shared\Archive_19_04\data_hkr\test",
+#                    r"C:\shared\Archive_19_04\data_school",
+#                    r"C:\shared\Archive_19_04\foreverschool_notebooks_RU\val"
+                    ]
     img_h, img_w = 60, 240
     batch_size, epochs, lr = 128, 40, 1e-3
 
-    alphabet = OCRDataset.build_alphabet(train_csvs + val_csvs, min_char_freq=30)
+    alphabet = OCRDataset.build_alphabet(train_csvs + val_csvs, min_char_freq=30, ignore_case=True)
     num_classes = len(alphabet) + 1
 
     train_loader, val_loader = create_dataloaders(

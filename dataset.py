@@ -90,12 +90,15 @@ class OCRDataset(Dataset):
         augment: bool = False,
         zoom_prob: float = 0.2,
         zoom_ratio: float = 0.2,
+        ignore_case: bool = False,  
     ):
         # 1) читаем CSV
         samples = []
         with open(csv_path, newline="", encoding=encoding) as f:
             reader = csv.reader(f, delimiter="\t")
             for fname, label in reader:
+                if ignore_case:
+                    label = label.lower()
                 samples.append((label, fname))
 
         # 2) строим or принимаем алфавит
@@ -122,6 +125,7 @@ class OCRDataset(Dataset):
         self.augment = augment
         self.zoom_prob = zoom_prob
         self.zoom_ratio = zoom_ratio
+        self.ignore_case = ignore_case
 
         # 5) PIL-аугментации
         self.aug_pil = T.Compose(
@@ -181,9 +185,16 @@ class OCRDataset(Dataset):
             img = img.crop((left, 0, new_w - right, self.img_h))
             new_w = img.size[0]
 
-        # — 3) PIL-аугментации
+        # — 3) PIL-аугментации с защитой от LinAlgError
         if self.augment:
-            img = self.aug_pil(img)
+            try:
+                img = self.aug_pil(img)
+            except torch._C._LinAlgError:
+                # RandomPerspective может падать при вырожденном матричном уравнении
+                pass
+            except Exception:
+                # глушим любые другие неожиданные ошибки PIL-аугментаций
+                pass
 
         # — 4) to_tensor + normalize → [–1..+1]
         tensor = TF.to_tensor(img)  # [0..1]
@@ -192,7 +203,6 @@ class OCRDataset(Dataset):
         # — 5) right-pad белым до img_w
         pad_w = self.img_w - new_w
         if pad_w > 0:
-            # TF.pad принимает (left, top, right, bottom)
             tensor = TF.pad(tensor, (0, 0, pad_w, 0), fill=1.0)
 
         # — 6) Tensor-аугментации
@@ -216,13 +226,15 @@ class OCRDataset(Dataset):
 
     @staticmethod
     def build_alphabet(
-        csv_paths: List[str], min_char_freq: int = 1, encoding: str = "utf-8"
+        csv_paths: List[str], min_char_freq: int = 1, encoding: str = "utf-8", ignore_case: bool = False,  
     ) -> str:
         counter = Counter()
         for p in csv_paths:
             with open(p, newline="", encoding=encoding) as f:
                 reader = csv.reader(f, delimiter="\t")
                 for _, lbl in reader:
+                    if ignore_case:
+                        lbl = lbl.lower()
                     counter.update(lbl)
         return "".join(
             sorted(ch for ch, freq in counter.items() if freq >= min_char_freq)
