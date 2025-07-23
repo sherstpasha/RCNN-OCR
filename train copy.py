@@ -187,15 +187,15 @@ def main(use_profiler=False):
     train_csvs = [
         r"C:\shared\Archive_19_04\data_archive\gt_train.txt",
                    r"C:\shared\Archive_19_04\data_cyrillic\gt_train.txt",
-                     r"C:\shared\Archive_19_04\data_hkr\gt_train.txt",
-                     r"C:\shared\Archive_19_04\data_school\gt_train.txt",
+#                     r"C:\shared\Archive_19_04\data_hkr\gt_train.txt",
+#                     r"C:\shared\Archive_19_04\data_school\gt_train.txt",
                      r"C:\shared\Archive_19_04\foreverschool_notebooks_RU\train.csv"
                      ]
     train_roots = [
         r"C:\shared\Archive_19_04\data_archive",
                     r"C:\shared\Archive_19_04\data_cyrillic\train",
-                      r"C:\shared\Archive_19_04\data_hkr\train",
-                      r"C:\shared\Archive_19_04\data_school",
+#                      r"C:\shared\Archive_19_04\data_hkr\train",
+#                      r"C:\shared\Archive_19_04\data_school",
                       r"C:\shared\Archive_19_04\foreverschool_notebooks_RU\train"
                       ]
     val_csvs = [
@@ -237,9 +237,9 @@ def main(use_profiler=False):
     )
     scaler = GradScaler()
 
-    writer = SummaryWriter(log_dir="runs/exp")
+    writer = SummaryWriter(log_dir="runs/exp2")
     best_loss, best_acc = float("inf"), 0.0
-    os.makedirs("checkpoints", exist_ok=True)
+    os.makedirs("checkpoints1", exist_ok=True)
 
     for e in range(1, epochs + 1):
         t_loss, t_acc, t_cer, t_wer = train_epoch(
@@ -295,10 +295,10 @@ def main(use_profiler=False):
         # save best
         if v_loss < best_loss:
             best_loss = v_loss
-            torch.save(model.state_dict(), "checkpoints/best_by_loss.pth")
+            torch.save(model.state_dict(), "checkpoints1/best_by_loss.pth")
         if v_acc > best_acc:
             best_acc = v_acc
-            torch.save(model.state_dict(), "checkpoints/best_by_acc.pth")
+            torch.save(model.state_dict(), "checkpoints1/best_by_acc.pth")
 
         scheduler.step(v_loss)
 
