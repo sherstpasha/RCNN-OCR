@@ -2,6 +2,10 @@
 
 import torch
 from model import TRBA
+import random
+import numpy as np
+import textwrap
+import matplotlib.pyplot as plt
 
 
 def load_crnn(
@@ -57,3 +61,32 @@ def ctc_greedy_decoder(
             prev = i
         preds.append("".join(coll))
     return preds, raws
+
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+
+def log_samples(
+    epoch, imgs, lab_lens, preds, raws, truths, writer, n=5, tag="Examples"
+):
+    count = len(truths)
+    n = min(n, count)
+    idxs = random.sample(range(count), n)
+    fig, axs = plt.subplots(n, 1, figsize=(6, 2 * n))
+    for i, idx in enumerate(idxs):
+        img_np = imgs[idx].cpu().squeeze(0).numpy()
+        axs[i].imshow(img_np, cmap="gray")
+        title = f"GT: {truths[idx]} | Pred: {preds[idx]}"
+        wrapped = "\n".join(textwrap.wrap(title, width=40))
+        axs[i].set_title(f"{wrapped}\nRaw: {raws[idx]}", fontsize=8)
+        axs[i].axis("off")
+    writer.add_figure(tag, fig, epoch)
+    plt.close(fig)

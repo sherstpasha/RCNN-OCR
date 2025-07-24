@@ -4,13 +4,14 @@ import os
 import csv
 import random
 from collections import Counter
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
+from torch.utils.data import DataLoader, ConcatDataset
 
 
 class AddGaussianNoise:
@@ -90,7 +91,7 @@ class OCRDataset(Dataset):
         augment: bool = False,
         zoom_prob: float = 0.2,
         zoom_ratio: float = 0.2,
-        ignore_case: bool = False,  
+        ignore_case: bool = False,
     ):
         # 1) читаем CSV
         samples = []
@@ -226,7 +227,10 @@ class OCRDataset(Dataset):
 
     @staticmethod
     def build_alphabet(
-        csv_paths: List[str], min_char_freq: int = 1, encoding: str = "utf-8", ignore_case: bool = False,  
+        csv_paths: List[str],
+        min_char_freq: int = 1,
+        encoding: str = "utf-8",
+        ignore_case: bool = False,
     ) -> str:
         counter = Counter()
         for p in csv_paths:
@@ -239,3 +243,49 @@ class OCRDataset(Dataset):
         return "".join(
             sorted(ch for ch, freq in counter.items() if freq >= min_char_freq)
         )
+
+
+def create_dataloaders(
+    train_csvs,
+    train_roots,
+    val_csvs,
+    val_roots,
+    alphabet,
+    img_h,
+    img_w,
+    batch_size,
+    num_workers=4,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=2,
+):
+    train_sets = [
+        OCRDataset(c, r, alphabet, img_h, img_w, augment=True, ignore_case=True)
+        for c, r in zip(train_csvs, train_roots)
+    ]
+    val_sets = [
+        OCRDataset(c, r, alphabet, img_h, img_w, augment=False, ignore_case=True)
+        for c, r in zip(val_csvs, val_roots)
+    ]
+    return (
+        DataLoader(
+            ConcatDataset(train_sets),
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+            collate_fn=OCRDataset.collate_fn,
+        ),
+        DataLoader(
+            ConcatDataset(val_sets),
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+            collate_fn=OCRDataset.collate_fn,
+        ),
+    )
