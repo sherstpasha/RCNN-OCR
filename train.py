@@ -134,12 +134,12 @@ def validate_epoch(model, loader, criterion, device, writer, epoch, alphabet):
 def main():
     set_seed(42)
     exp_name = "exp1"  # задайте имя эксперимента здесь
-    train_csvs = [r"C:\shared\Archive_19_04\data_hkr\gt_train.txt"]
-    train_roots = [r"C:\shared\Archive_19_04\data_hkr\train"]
-    val_csvs = [r"C:\shared\Archive_19_04\data_hkr\gt_test.txt"]
-    val_roots = [r"C:\shared\Archive_19_04\data_hkr\test"]
+    train_csvs = [r"C:\shared\Archive_19_04\data_cyrillic\gt_train.txt"]
+    train_roots = [r"C:\shared\Archive_19_04\data_cyrillic\train"]
+    val_csvs = [r"C:\shared\Archive_19_04\data_cyrillic\gt_test.txt"]
+    val_roots = [r"C:\shared\Archive_19_04\data_cyrillic\test"]
     img_h, img_w = 60, 240
-    batch_size, epochs, lr = 128, 40, 1e-3
+    batch_size, epochs, lr = 64, 40, 1e-3
 
     alphabet = OCRDataset.build_alphabet(
         train_csvs + val_csvs, min_char_freq=30, ignore_case=True

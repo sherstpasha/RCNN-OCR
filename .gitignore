@@ -52,6 +52,8 @@ Thumbs.db
 # Logs
 *.log
 
+/exp*
+
 # PyTorch / TensorBoard
 runs/
 checkpoints/

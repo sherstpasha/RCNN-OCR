@@ -3,8 +3,9 @@ import torch.nn as nn
 from kornia.geometry.transform import get_tps_transform, warp_image_tps
 from torch import Tensor
 from typing import Optional
+import torch.nn.functional as F
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class BasicBlock(nn.Module):
@@ -40,7 +41,9 @@ def build_fiducial_points(num_fiducial: int) -> torch.Tensor:
 
 class ResNet(nn.Module):
     # unchanged stage definitions
-    def __init__(self, input_channel: int, output_channel: int, block, layers: list[int]):
+    def __init__(
+        self, input_channel: int, output_channel: int, block, layers: list[int]
+    ):
         super().__init__()
         self.output_channel_block = [
             output_channel // 4,
@@ -50,38 +53,85 @@ class ResNet(nn.Module):
         ]
         self.inplanes = output_channel // 8
         # initial conv layers
-        self.conv0_1 = nn.Conv2d(input_channel, output_channel // 16, 3, 1, 1, bias=False)
+        self.conv0_1 = nn.Conv2d(
+            input_channel, output_channel // 16, 3, 1, 1, bias=False
+        )
         self.bn0_1 = nn.BatchNorm2d(output_channel // 16)
-        self.conv0_2 = nn.Conv2d(output_channel // 16, self.inplanes, 3, 1, 1, bias=False)
+        self.conv0_2 = nn.Conv2d(
+            output_channel // 16, self.inplanes, 3, 1, 1, bias=False
+        )
         self.bn0_2 = nn.BatchNorm2d(self.inplanes)
         self.relu = nn.ReLU(inplace=True)
         # stage1
         self.maxpool1 = nn.MaxPool2d(2, 2)
         self.layer1 = self._make_layer(block, self.output_channel_block[0], layers[0])
-        self.conv1 = nn.Conv2d(self.output_channel_block[0], self.output_channel_block[0], 3, 1, 1, bias=False)
+        self.conv1 = nn.Conv2d(
+            self.output_channel_block[0],
+            self.output_channel_block[0],
+            3,
+            1,
+            1,
+            bias=False,
+        )
         self.bn1 = nn.BatchNorm2d(self.output_channel_block[0])
         # stage2
         self.maxpool2 = nn.MaxPool2d(2, 2)
-        self.layer2 = self._make_layer(block, self.output_channel_block[1], layers[1], stride=1)
-        self.conv2 = nn.Conv2d(self.output_channel_block[1], self.output_channel_block[1], 3, 1, 1, bias=False)
+        self.layer2 = self._make_layer(
+            block, self.output_channel_block[1], layers[1], stride=1
+        )
+        self.conv2 = nn.Conv2d(
+            self.output_channel_block[1],
+            self.output_channel_block[1],
+            3,
+            1,
+            1,
+            bias=False,
+        )
         self.bn2 = nn.BatchNorm2d(self.output_channel_block[1])
         # stage3
         self.maxpool3 = nn.MaxPool2d((2, 1), (2, 1), padding=(0, 0))
-        self.layer3 = self._make_layer(block, self.output_channel_block[2], layers[2], stride=1)
-        self.conv3 = nn.Conv2d(self.output_channel_block[2], self.output_channel_block[2], 3, 1, 1, bias=False)
+        self.layer3 = self._make_layer(
+            block, self.output_channel_block[2], layers[2], stride=1
+        )
+        self.conv3 = nn.Conv2d(
+            self.output_channel_block[2],
+            self.output_channel_block[2],
+            3,
+            1,
+            1,
+            bias=False,
+        )
         self.bn3 = nn.BatchNorm2d(self.output_channel_block[2])
         # stage4
-        self.layer4 = self._make_layer(block, self.output_channel_block[3], layers[3], stride=1)
-        self.conv4_1 = nn.Conv2d(self.output_channel_block[3], self.output_channel_block[3], 2, (2, 1), (0, 1), bias=False)
+        self.layer4 = self._make_layer(
+            block, self.output_channel_block[3], layers[3], stride=1
+        )
+        self.conv4_1 = nn.Conv2d(
+            self.output_channel_block[3],
+            self.output_channel_block[3],
+            2,
+            (2, 1),
+            (0, 1),
+            bias=False,
+        )
         self.bn4_1 = nn.BatchNorm2d(self.output_channel_block[3])
-        self.conv4_2 = nn.Conv2d(self.output_channel_block[3], self.output_channel_block[3], 2, 1, 0, bias=False)
+        self.conv4_2 = nn.Conv2d(
+            self.output_channel_block[3],
+            self.output_channel_block[3],
+            2,
+            1,
+            0,
+            bias=False,
+        )
         self.bn4_2 = nn.BatchNorm2d(self.output_channel_block[3])
 
     def _make_layer(self, block, planes: int, blocks: int, stride: int = 1):
         downsample = None
         if stride != 1 or self.inplanes != planes * block.expansion:
             downsample = nn.Sequential(
-                nn.Conv2d(self.inplanes, planes * block.expansion, 1, stride, bias=False),
+                nn.Conv2d(
+                    self.inplanes, planes * block.expansion, 1, stride, bias=False
+                ),
                 nn.BatchNorm2d(planes * block.expansion),
             )
         layers = [block(self.inplanes, planes, stride, downsample)]
@@ -111,11 +161,19 @@ class TPS_STN(nn.Module):
         super().__init__()
         feat_h, feat_w = H // 8, W // 8
         self.loc_net = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
-            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
-            nn.AdaptiveAvgPool2d((feat_h, feat_w)), nn.Flatten(),
-            nn.Linear(128 * feat_h * feat_w, 256), nn.ReLU(),
+            nn.Conv2d(1, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.AdaptiveAvgPool2d((feat_h, feat_w)),
+            nn.Flatten(),
+            nn.Linear(128 * feat_h * feat_w, 256),
+            nn.ReLU(),
             nn.Linear(256, num_fiducial * 2),
         )
         ctrl = build_fiducial_points(num_fiducial)
@@ -173,7 +231,7 @@ class Attention(nn.Module):
         outputs = torch.zeros(B, T, self.hidden_size, device=device)
         hidden = (
             torch.zeros(B, self.hidden_size, device=device),
-            torch.zeros(B, self.hidden_size, device=device)
+            torch.zeros(B, self.hidden_size, device=device),
         )
         if is_train:
             for i in range(T):
@@ -193,9 +251,50 @@ class Attention(nn.Module):
         return preds
 
 
+class ResNetScaleB(ResNet):
+    """
+    Second CNN backbone with modified pooling layers for multi-scale feature extraction.
+    Inherits from original ResNet but replaces stage2 and stage3 pooling.
+    """
+
+    def __init__(
+        self, input_channel: int, output_channel: int, block, layers: list[int]
+    ):
+        super().__init__(input_channel, output_channel, block, layers)
+        # Replace pooling layers with AvgPool variants
+        self.maxpool2 = nn.AvgPool2d(2, 2)
+        self.maxpool3 = nn.AvgPool2d((2, 1), (2, 1))
+
+
+class MultiScaleFusion(nn.Module):
+    """
+    Fuse features from two scale streams after adaptive pooling.
+    Supports 'add' or 'cat' fusion with optional 1x1 conv when concatenating.
+    """
+
+    def __init__(self, channels: int, fuse_method: str = "add"):
+        super().__init__()
+        assert fuse_method in ("add", "cat"), "fuse_method must be 'add' or 'cat'"
+        self.method = fuse_method
+        if fuse_method == "cat":
+            # Reduce channels back to original via 1x1 conv
+            self.conv = nn.Conv2d(2 * channels, channels, kernel_size=1)
+
+    def forward(self, fa: Tensor, fb: Tensor) -> Tensor:
+        # fa: [B, C, 1, W], fb: [B, C, 1, W_b]
+        _, _, _, W = fa.size()
+        # Upsample fb to width W
+        fb_up = F.interpolate(fb, size=(1, W), mode="bilinear", align_corners=False)
+        if self.method == "add":
+            return fa + fb_up
+        else:  # cat
+            fused = torch.cat([fa, fb_up], dim=1)  # [B, 2C, 1, W]
+            return self.conv(fused)  # [B, C, 1, W]
+
+
 class TRBA(nn.Module):
     """
-    TRBA OCR model with ResNet backbone, optional TPS STN and attention decoder
+    Multi-Scale TRBA model: two CNN backbones (cnn_a, cnn_b) + fusion before BiLSTM.
     """
 
     def __init__(
@@ -207,42 +306,77 @@ class TRBA(nn.Module):
         use_attention: bool = False,
         att_hidden_size: int = 256,
         att_max_length: Optional[int] = None,
+        fuse_method: str = "add",
     ):
         super().__init__()
+        # Optional TPS Spatial Transformer
         self.stn = TPS_STN(20, img_height, img_width) if transform == "tps" else None
-        self.cnn = ResNet(1, 512, BasicBlock, [1, 2, 5, 3])
-        cnn_out = 512
+
+        # Two CNN backbones
+        self.cnn_a = ResNet(1, 512, BasicBlock, [1, 2, 5, 3])
+        self.cnn_b = ResNetScaleB(1, 512, BasicBlock, [1, 2, 5, 3])
+
+        # Adaptive pooling
         self.adaptive_pool = nn.AdaptiveAvgPool2d((1, None))
-        self.rnn = nn.LSTM(cnn_out, 256, 2, bidirectional=True, batch_first=True, dropout=0.3)
+
+        # Fusion module
+        self.fusion = MultiScaleFusion(channels=512, fuse_method=fuse_method)
+
+        # BiLSTM encoder
+        rnn_input_size = 512
+        self.rnn = nn.LSTM(
+            rnn_input_size,
+            256,
+            num_layers=2,
+            bidirectional=True,
+            batch_first=True,
+            dropout=0.3,
+        )
         self.layer_norm = nn.LayerNorm(512)
         self.dropout = nn.Dropout(0.3)
+
+        # Decoder
         self.use_attention = use_attention
         self.num_classes = num_classes
         self.att_max_length = att_max_length
         if use_attention:
-            self.att = Attention(input_size=512, hidden_size=att_hidden_size, num_classes=num_classes)
+            self.att = Attention(
+                input_size=512, hidden_size=att_hidden_size, num_classes=num_classes
+            )
         else:
             self.fc = nn.Linear(512, num_classes)
 
     def forward(
-        self,
-        x: Tensor,
-        text: Optional[Tensor] = None,
-        is_train: bool = True,
+        self, x: Tensor, text: Optional[Tensor] = None, is_train: bool = True
     ) -> Tensor:
+        # Spatial transform
         if self.stn is not None:
             x = self.stn(x)
-        f = self.cnn(x)
-        f = self.adaptive_pool(f)
-        B, C, _, Wp = f.shape
-        feat = f.view(B, C, Wp).permute(0, 2, 1)  # [B, S, F]
+
+        # Two-scale feature maps
+        fa = self.cnn_a(x)  # [B, C, H', W_a]
+        fb = self.cnn_b(x)  # [B, C, H', W_b]
+
+        # Adaptive pooling to [B, C, 1, W]
+        fa = self.adaptive_pool(fa)
+        fb = self.adaptive_pool(fb)
+
+        # Fuse features
+        fused = self.fusion(fa, fb)  # [B, C, 1, W]
+
+        # Prepare for RNN: reshape to [B, W, C]
+        B, C, _, W = fused.size()
+        feat = fused.view(B, C, W).permute(0, 2, 1)
+
+        # BiLSTM encoding
         rnn_out, _ = self.rnn(feat)
         rnn_out = self.dropout(self.layer_norm(rnn_out))
+
+        # Decode
         if self.use_attention:
-            assert text is not None, "`text` must be provided for attention mode"
+            assert text is not None, "'text' must be provided for attention mode"
             logits = self.att(rnn_out, text, is_train)
-            # logits: [B, T, C] -> [T, B, C]
-            return logits.permute(1, 0, 2)
-        # CTC path
-        logits = self.fc(rnn_out)  # [B, S, C]
-        return logits.permute(1, 0, 2)  # [S, B, C]
+            return logits.permute(1, 0, 2)  # [T, B, C]
+        else:
+            logits = self.fc(rnn_out)  # [B, W, C]
+            return logits.permute(1, 0, 2)  # [W, B, C]
