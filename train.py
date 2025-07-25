@@ -22,10 +22,6 @@ from metrics import character_error_rate, word_error_rate, compute_accuracy
 
 
 def infer_batch(model, imgs, labs, lab_lens, alphabet, device, is_train):
-    """
-    Выполняет прямой проход и жадный декодинг для батча.
-    Возвращает (out, preds, raws, loss, refs).
-    """
     imgs, labs = imgs.to(device), labs.to(device)
     lab_lens = lab_lens.to(device)
 
@@ -131,103 +127,73 @@ def validate_epoch(model, loader, criterion, device, writer, epoch, alphabet):
     return avg_loss, acc, cer, wer
 
 
-def main():
+def run_experiment(
+    exp_name,
+    train_csvs,
+    train_roots,
+    val_csvs,
+    val_roots,
+    img_h=60,
+    img_w=240,
+    batch_size=128,
+    epochs=20,
+    lr=1e-3,
+    transform=None,
+    use_attention=False,
+):
     set_seed(42)
-    exp_name = "exp_1bb_ctc"  # задайте имя эксперимента здесь
-    train_csvs = [
-#        r"C:\shared\Archive_19_04\data_archive\gt_train.txt",
-                   r"C:\shared\Archive_19_04\data_cyrillic\gt_train.txt",
-#                     r"C:\shared\Archive_19_04\data_hkr\gt_train.txt",
-#                     r"C:\shared\Archive_19_04\data_school\gt_train.txt",
-#                     r"C:\shared\Archive_19_04\foreverschool_notebooks_RU\train.csv"
-                     ]
-    train_roots = [
-#        r"C:\shared\Archive_19_04\data_archive",
-                    r"C:\shared\Archive_19_04\data_cyrillic\train",
-#                      r"C:\shared\Archive_19_04\data_hkr\train",
-#                      r"C:\shared\Archive_19_04\data_school",
-#                      r"C:\shared\Archive_19_04\foreverschool_notebooks_RU\train"
-                      ]
-    val_csvs = [
-#        r"C:\shared\Archive_19_04\data_archive\gt_test.txt",
-                 r"C:\shared\Archive_19_04\data_cyrillic\gt_test.txt",
-#                 r"C:\shared\Archive_19_04\data_hkr\gt_test.txt",
-#                 r"C:\shared\Archive_19_04\data_school\gt_test.txt",
-#                 r"C:\shared\Archive_19_04\foreverschool_notebooks_RU\val.csv"
-                 ]
-    val_roots = [
-#        r"C:\shared\Archive_19_04\data_archive",
-                  r"C:\shared\Archive_19_04\data_cyrillic\test",
-#                    r"C:\shared\Archive_19_04\data_hkr\test",
-#                    r"C:\shared\Archive_19_04\data_school",
-#                    r"C:\shared\Archive_19_04\foreverschool_notebooks_RU\val"
-                    ]
-    img_h, img_w = 60, 240
-    batch_size, epochs, lr = 128, 40, 1e-3
-
+    # Prepare alphabet and data loaders
     alphabet = OCRDataset.build_alphabet(
-        train_csvs + val_csvs, min_char_freq=30, ignore_case=True
+        train_csvs + val_csvs, min_char_freq=1, ignore_case=True
     )
     num_classes = len(alphabet) + 1
     train_loader, val_loader = create_dataloaders(
-        train_csvs, train_roots, val_csvs, val_roots, alphabet, img_h, img_w, batch_size
+        train_csvs, train_roots, val_csvs, val_roots,
+        alphabet, img_h, img_w, batch_size, 8
     )
 
+    # Model, criterion, optimizer, scheduler, scaler
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TRBA(img_h, img_w, num_classes, transform=None, use_attention=False).to(
-        device
-    )
-
-    if model.use_attention:
+    model = TRBA(img_h, img_w, num_classes, transform=transform, use_attention=use_attention).to(device)
+    if use_attention:
         pad_idx = num_classes - 1
         criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
     else:
         criterion = nn.CTCLoss(blank=0, zero_infinity=True)
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=2
-    )
+    scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
     scaler = GradScaler()
 
-    # Setup experiment directories
+    # Directories and writer
     base_dir = exp_name
     log_dir = os.path.join(base_dir, "logs")
     ckpt_dir = os.path.join(base_dir, "checkpoints")
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=log_dir)
-    best_loss, best_acc = float("inf"), 0.0
 
+    best_loss, best_acc = float("inf"), 0.0
     for e in range(1, epochs + 1):
         t_loss, t_acc, t_cer, t_wer = train_epoch(
-            model,
-            train_loader,
-            criterion,
-            optimizer,
-            device,
-            scaler,
-            writer,
-            e,
-            alphabet,
+            model, train_loader, criterion, optimizer, device, scaler, writer, e, alphabet
         )
-
         v_loss, v_acc, v_cer, v_wer = validate_epoch(
             model, val_loader, criterion, device, writer, e, alphabet
         )
+
         imgs, labs, _, lab_lens = next(iter(val_loader))
         with torch.no_grad():
             _, preds, raws, _, truths = infer_batch(
                 model, imgs, labs, lab_lens, alphabet, device, is_train=False
             )
-        log_samples(
-            e, imgs, lab_lens, preds, raws, truths, writer, n=10, tag="Val/Examples"
-        )
+        log_samples(e, imgs, lab_lens, preds, raws, truths, writer, n=10, tag="Val/Examples")
 
         print(
-            f"Epoch {e}/{epochs} | "
+            f"[{exp_name}] Epoch {e}/{epochs} "
             f"Train L={t_loss:.4f} Acc={t_acc:.4f} CER={t_cer:.4f} WER={t_wer:.4f} | "
             f"Val L={v_loss:.4f} Acc={v_acc:.4f} CER={v_cer:.4f} WER={v_wer:.4f}"
         )
+        # Save best
         if v_loss < best_loss:
             best_loss = v_loss
             torch.save(model.state_dict(), os.path.join(ckpt_dir, "best_by_loss.pth"))
@@ -238,6 +204,97 @@ def main():
 
     writer.close()
 
-
 if __name__ == "__main__":
-    main()
+    experiments = [
+        {
+            "exp_name": "exptps_ctc_s",
+            "train_csvs": [r"C:\shared\orig_cyrillic\train.tsv"],
+            "train_roots": [r"C:\shared\orig_cyrillic\train"],
+            "val_csvs": [r"C:\shared\orig_cyrillic\test.tsv"],
+            "val_roots": [r"C:\shared\orig_cyrillic\test"],
+            "use_attention": False,
+            "transform": "tps",
+            "img_h": 32,
+            "img_w": 128
+        },
+        {
+            "exp_name": "exp_ctc_s",
+            "train_csvs": [r"C:\shared\orig_cyrillic\train.tsv"],
+            "train_roots": [r"C:\shared\orig_cyrillic\train"],
+            "val_csvs": [r"C:\shared\orig_cyrillic\test.tsv"],
+            "val_roots": [r"C:\shared\orig_cyrillic\test"],
+            "use_attention": False,
+            "transform": None,
+            "img_h": 32,
+            "img_w": 128
+        },
+        {
+            "exp_name": "exp_attn_s",
+            "train_csvs": [r"C:\shared\orig_cyrillic\train.tsv"],
+            "train_roots": [r"C:\shared\orig_cyrillic\train"],
+            "val_csvs": [r"C:\shared\orig_cyrillic\test.tsv"],
+            "val_roots": [r"C:\shared\orig_cyrillic\test"],
+            "use_attention": True,
+            "transform": None,
+            "img_h": 32,
+            "img_w": 128
+        },
+        {
+            "exp_name": "exptps_atnn_s",
+            "train_csvs": [r"C:\shared\orig_cyrillic\train.tsv"],
+            "train_roots": [r"C:\shared\orig_cyrillic\train"],
+            "val_csvs": [r"C:\shared\orig_cyrillic\test.tsv"],
+            "val_roots": [r"C:\shared\orig_cyrillic\test"],
+            "use_attention": True,
+            "transform": "tps",
+            "img_h": 32,
+            "img_w": 128
+        },
+        {
+            "exp_name": "exptps_ctc_s",
+            "train_csvs": [r"C:\shared\orig_cyrillic\train.tsv"],
+            "train_roots": [r"C:\shared\orig_cyrillic\train"],
+            "val_csvs": [r"C:\shared\orig_cyrillic\test.tsv"],
+            "val_roots": [r"C:\shared\orig_cyrillic\test"],
+            "use_attention": False,
+            "transform": "tps",
+        },
+        {
+            "exp_name": "exp_ctc",
+            "train_csvs": ["C:\shared\orig_cyrillic\train.tsv"],
+            "train_roots": [r"C:\shared\orig_cyrillic\train"],
+            "val_csvs": ["C:\shared\orig_cyrillic\test.tsv"],
+            "val_roots": [r"C:\shared\orig_cyrillic\test"],
+            "use_attention": False,
+            "transform": None,
+        },
+        {
+            "exp_name": "exp_attn",
+            "train_csvs": [r"C:\shared\orig_cyrillic\train.tsv"],
+            "train_roots": [r"C:\shared\orig_cyrillic\train"],
+            "val_csvs": [r"C:\shared\orig_cyrillic\test.tsv"],
+            "val_roots": [r"C:\shared\orig_cyrillic\test"],
+            "use_attention": True,
+            "transform": None,
+        },
+        {
+            "exp_name": "exptps_atnn",
+            "train_csvs": [r"C:\shared\orig_cyrillic\train.tsv"],
+            "train_roots": [r"C:\shared\orig_cyrillic\train"],
+            "val_csvs": [r"C:\shared\orig_cyrillic\test.tsv"],
+            "val_roots": [r"C:\shared\orig_cyrillic\test"],
+            "use_attention": True,
+            "transform": "tps",
+        },
+    ]
+
+    for cfg in experiments:
+        run_experiment(
+            exp_name=cfg["exp_name"],
+            train_csvs=cfg["train_csvs"],
+            train_roots=cfg["train_roots"],
+            val_csvs=cfg["val_csvs"],
+            val_roots=cfg["val_roots"],
+            transform=cfg.get("transform"),
+            use_attention=cfg.get("use_attention", False),
+        )

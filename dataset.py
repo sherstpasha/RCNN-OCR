@@ -90,7 +90,7 @@ class OCRDataset(Dataset):
         encoding: str = "utf-8",
         augment: bool = False,
         zoom_prob: float = 0.2,
-        zoom_ratio: float = 0.2,
+        zoom_ratio: float = 0.05,
         ignore_case: bool = False,
     ):
         # 1) читаем CSV
