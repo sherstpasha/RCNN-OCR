@@ -54,14 +54,16 @@ def infer_batch(model, imgs, labs, lab_lens, alphabet, device):
 
         preds, raws, refs = [], [], []
         for i, seq in enumerate(pred_idxs):
-            s, prev = [], None
+            s = []
             for idx in seq.tolist():
-                if (
-                    idx not in (model.SOS_IDX, model.EOS_IDX, model.PAD_IDX)
-                    and idx != prev
-                ):
-                    s.append(alphabet[idx - 1])
-                prev = idx
+                # как только встретили EOS — выходим из цикла
+                if idx == model.EOS_IDX:
+                    break
+                # пропускаем только специальные токены
+                if idx in (model.SOS_IDX, model.PAD_IDX):
+                    continue
+                # добавляем ВСЕ символы, включая дубли
+                s.append(alphabet[idx - 1])
             preds.append("".join(s))
 
             raws.append(
@@ -368,5 +370,6 @@ if __name__ == "__main__":
             val_roots=cfg["val_roots"],
             transform=cfg.get("transform"),
             use_attention=cfg.get("use_attention", False),
-            batch_size=32,
+            batch_size=64,
+            epochs=40,
         )
