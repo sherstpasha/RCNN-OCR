@@ -90,3 +90,8 @@ def log_samples(
         axs[i].axis("off")
     writer.add_figure(tag, fig, epoch)
     plt.close(fig)
+
+
+def make_mask(batch_lengths: torch.Tensor, max_len: int) -> torch.BoolTensor:
+    idxs = torch.arange(max_len, device=batch_lengths.device).unsqueeze(0)
+    return idxs < batch_lengths.unsqueeze(1)

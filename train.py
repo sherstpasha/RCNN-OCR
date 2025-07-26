@@ -16,87 +16,162 @@ from torch.amp import autocast, GradScaler
 from tqdm.auto import tqdm
 
 from dataset import OCRDataset, create_dataloaders
-from model import TRBA
+from model import TRBA, decode_attention, build_attention_inputs
 from utils import ctc_greedy_decoder, set_seed, log_samples
 from metrics import character_error_rate, word_error_rate, compute_accuracy
+from typing import Optional, List, Tuple
 
 
-def infer_batch(model, imgs, labs, lab_lens, alphabet, device, is_train):
-    imgs, labs = imgs.to(device), labs.to(device)
+def infer_batch(model, imgs, labs, lab_lens, alphabet, device):
+    imgs = imgs.to(device)
     lab_lens = lab_lens.to(device)
 
     if model.use_attention:
         B = imgs.size(0)
-        seqs, offset = [], 0
+        seqs = []
+        offset = 0
         for L in lab_lens.tolist():
             seqs.append(labs[offset : offset + L])
             offset += L
         max_L = max(s.size(0) for s in seqs)
-        text_input = torch.zeros(B, max_L + 1, dtype=torch.long, device=device)
+
+        text_input = torch.full(
+            (B, max_L + 2), model.PAD_IDX, dtype=torch.long, device=device
+        )
+        text_input[:, 0] = model.SOS_IDX
         for i, s in enumerate(seqs):
-            text_input[i, 1 : 1 + s.size(0)] = s
-        inputs, targets = text_input[:, :-1], text_input[:, 1:]
-        with autocast(device.type):
-            out = model(imgs, text=inputs, is_train=is_train)
-            T, B2, C = out.size()
-            logits = out.permute(1, 0, 2).reshape(B2 * T, C)
-            loss = model.criterion(logits, targets.reshape(B2 * T))
-        pred_idxs = out.argmax(dim=2).transpose(0, 1)
-        preds, raws = [], []
-        for seq in pred_idxs:
-            s, prev = [], 0
+            L = s.size(0)
+            text_input[i, 1 : 1 + L] = s.to(device)
+            text_input[i, 1 + L] = model.EOS_IDX
+
+        with torch.no_grad():
+            out = model(imgs, text=text_input, is_train=False)
+
+        if out.dim() == 3:
+            pred_idxs = out.argmax(dim=2)
+        else:
+            pred_idxs = out
+
+        preds, raws, refs = [], [], []
+        for i, seq in enumerate(pred_idxs):
+            s, prev = [], None
             for idx in seq.tolist():
-                if idx != 0 and idx != prev:
+                if (
+                    idx not in (model.SOS_IDX, model.EOS_IDX, model.PAD_IDX)
+                    and idx != prev
+                ):
                     s.append(alphabet[idx - 1])
                 prev = idx
             preds.append("".join(s))
+
             raws.append(
-                "".join(alphabet[i - 1] if i > 0 else "_" for i in seq.tolist())
+                "".join(
+                    alphabet[i - 1] if 1 <= i <= len(alphabet) else "_"
+                    for i in seq.tolist()
+                )
             )
+
+            lab_seq = seqs[i].tolist()
+            refs.append("".join(alphabet[j - 1] for j in lab_seq if j > 0))
+
+        return preds, raws, refs
     else:
-        with autocast(device.type):
+        with torch.no_grad():
             out = model(imgs)
-            T, B2, _ = out.size()
-            inp_lens = torch.full((B2,), T, dtype=torch.long, device=device)
-            loss = model.criterion(out.float(), labs, inp_lens, lab_lens)
         preds, raws = ctc_greedy_decoder(out, alphabet)
 
-    refs = []
-    offset = 0
-    for L in lab_lens.tolist():
-        seq = labs[offset : offset + L].tolist()
-        offset += L
-        refs.append("".join(alphabet[i - 1] for i in seq if i > 0))
-    return out, preds, raws, loss, refs
+        refs = []
+        offset = 0
+        for L in lab_lens.tolist():
+            lab_seq = labs[offset : offset + L].tolist()
+            offset += L
+            refs.append("".join(alphabet[j - 1] for j in lab_seq if j > 0))
+
+        return preds, raws, refs
 
 
 def train_epoch(
-    model, loader, criterion, optimizer, device, scaler, writer, epoch, alphabet
-):
+    model: TRBA,
+    loader: torch.utils.data.DataLoader,
+    criterion: nn.Module,
+    optimizer: optim.Optimizer,
+    device: torch.device,
+    scaler: GradScaler,
+    writer: SummaryWriter,
+    epoch: int,
+    alphabet: List[str],
+) -> Tuple[float, float, float, float]:
+    """
+    Runs one training epoch and returns (avg_loss, accuracy, CER, WER).
+    """
     model.train()
-    model.criterion = criterion
-    loss_sum, refs, hyps = 0.0, [], []
-    step = (epoch - 1) * len(loader)
+    loss_sum = 0.0
+    all_refs, all_hyps = [], []
+    global_step = (epoch - 1) * len(loader)
+
     for imgs, labs, _, lab_lens in tqdm(loader, desc=f"Train {epoch}"):
-        step += 1
+        global_step += 1
+        imgs, labs = imgs.to(device), labs.to(device)
+        lab_lens = lab_lens.to(device)
         optimizer.zero_grad()
-        _, preds, _, loss, batch_refs = infer_batch(
-            model, imgs, labs, lab_lens, alphabet, device, is_train=True
-        )
+
+        if model.use_attention:
+            # split labels into list of tensors
+            seqs = []
+            offset = 0
+            for L in lab_lens.tolist():
+                seqs.append(labs[offset : offset + L])
+                offset += L
+            text_input, targets = build_attention_inputs(
+                seqs, model.SOS_IDX, model.EOS_IDX, model.PAD_IDX, device
+            )
+            with autocast(device.type):
+                outputs, _ = model(imgs, text=text_input, is_train=True)
+                # outputs: [B, T-1, C]
+                loss = criterion(
+                    outputs.reshape(-1, outputs.size(-1)), targets.reshape(-1)
+                )
+                pred_idxs = outputs.argmax(dim=2)
+            # decode
+            hyps_batch, refs_batch = decode_attention(
+                seqs, pred_idxs, alphabet, model.SOS_IDX, model.PAD_IDX
+            )
+        else:
+            with autocast(device.type):
+                out = model(imgs)
+                T, B2, C = out.size()
+                inp_lens = torch.full((B2,), T, device=device, dtype=torch.long)
+                loss = criterion(out.log_softmax(2), labs, inp_lens, lab_lens)
+            pred_idxs, _ = ctc_greedy_decoder(out, alphabet)
+            # references
+            refs_batch = []
+            offset = 0
+            for L in lab_lens.tolist():
+                seq = labs[offset : offset + L].tolist()
+                offset += L
+                refs_batch.append("".join(alphabet[j - 1] for j in seq if j > 0))
+            hyps_batch = pred_idxs
+
+        # backward
         scaler.scale(loss).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5)
         scaler.step(optimizer)
         scaler.update()
 
         loss_sum += loss.item()
-        writer.add_scalar("train/loss_step", loss.item(), step)
-        refs.extend(batch_refs)
-        hyps.extend(preds)
+        writer.add_scalar("train/loss_step", loss.item(), global_step)
 
+        all_refs.extend(refs_batch)
+        all_hyps.extend(hyps_batch)
+
+    # compute metrics
     avg_loss = loss_sum / len(loader)
-    acc = compute_accuracy(refs, hyps)
-    cer = sum(character_error_rate(r, h) for r, h in zip(refs, hyps)) / len(refs)
-    wer = sum(word_error_rate(r, h) for r, h in zip(refs, hyps)) / len(refs)
+    acc = compute_accuracy(all_refs, all_hyps)
+    cer = sum(character_error_rate(r, h) for r, h in zip(all_refs, all_hyps)) / len(
+        all_refs
+    )
+    wer = sum(word_error_rate(r, h) for r, h in zip(all_refs, all_hyps)) / len(all_refs)
+
     writer.add_scalar("train/loss", avg_loss, epoch)
     writer.add_scalar("train/accuracy", acc, epoch)
     writer.add_scalar("train/cer", cer, epoch)
@@ -104,22 +179,69 @@ def train_epoch(
     return avg_loss, acc, cer, wer
 
 
-def validate_epoch(model, loader, criterion, device, writer, epoch, alphabet):
+def validate_epoch(
+    model: TRBA,
+    loader: torch.utils.data.DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    writer: SummaryWriter,
+    epoch: int,
+    alphabet: List[str],
+) -> Tuple[float, float, float, float]:
+    """
+    Runs one validation epoch and returns (avg_loss, accuracy, CER, WER).
+    """
     model.eval()
-    model.criterion = criterion
-    loss_sum, refs, hyps = 0.0, [], []
+    loss_sum = 0.0
+    all_refs, all_hyps = [], []
+
     with torch.no_grad():
         for imgs, labs, _, lab_lens in tqdm(loader, desc=f"Val {epoch}"):
-            _, preds, raws, loss, batch_refs = infer_batch(
-                model, imgs, labs, lab_lens, alphabet, device, is_train=False
-            )
+            imgs, labs = imgs.to(device), labs.to(device)
+            lab_lens = lab_lens.to(device)
+
+            if model.use_attention:
+                seqs = []
+                offset = 0
+                for L in lab_lens.tolist():
+                    seqs.append(labs[offset : offset + L])
+                    offset += L
+                text_input, targets = build_attention_inputs(
+                    seqs, model.SOS_IDX, model.EOS_IDX, model.PAD_IDX, device
+                )
+                out, _ = model(imgs, text=text_input, is_train=True)
+                loss = criterion(out.reshape(-1, out.size(-1)), targets.reshape(-1))
+                pred_idxs = out.argmax(dim=2)
+                hyps_batch, refs_batch = decode_attention(
+                    seqs, pred_idxs, alphabet, model.SOS_IDX, model.PAD_IDX
+                )
+            else:
+                out = model(imgs)
+                T, B2, C = out.size()
+                inp_lens = torch.full((B2,), T, device=device, dtype=torch.long)
+                loss = criterion(out.log_softmax(2), labs, inp_lens, lab_lens)
+                pred_idxs, _ = ctc_greedy_decoder(out, alphabet)
+                refs_batch = []
+                offset = 0
+                for L in lab_lens.tolist():
+                    seq = labs[offset : offset + L].tolist()
+                    offset += L
+                    refs_batch.append("".join(alphabet[j - 1] for j in seq if j > 0))
+                hyps_batch = pred_idxs
+
             loss_sum += loss.item()
-            refs.extend(batch_refs)
-            hyps.extend(preds)
+            writer.add_scalar("val/loss_step", loss.item(), epoch)
+
+            all_refs.extend(refs_batch)
+            all_hyps.extend(hyps_batch)
+
     avg_loss = loss_sum / len(loader)
-    acc = compute_accuracy(refs, hyps)
-    cer = sum(character_error_rate(r, h) for r, h in zip(refs, hyps)) / len(refs)
-    wer = sum(word_error_rate(r, h) for r, h in zip(refs, hyps)) / len(refs)
+    acc = compute_accuracy(all_refs, all_hyps)
+    cer = sum(character_error_rate(r, h) for r, h in zip(all_refs, all_hyps)) / len(
+        all_refs
+    )
+    wer = sum(word_error_rate(r, h) for r, h in zip(all_refs, all_hyps)) / len(all_refs)
+
     writer.add_scalar("val/loss", avg_loss, epoch)
     writer.add_scalar("val/accuracy", acc, epoch)
     writer.add_scalar("val/cer", cer, epoch)
@@ -128,72 +250,91 @@ def validate_epoch(model, loader, criterion, device, writer, epoch, alphabet):
 
 
 def run_experiment(
-    exp_name,
-    train_csvs,
-    train_roots,
-    val_csvs,
-    val_roots,
-    img_h=60,
-    img_w=240,
-    batch_size=128,
-    epochs=20,
-    lr=1e-3,
-    transform=None,
-    use_attention=False,
+    exp_name: str,
+    train_csvs: List[str],
+    train_roots: List[str],
+    val_csvs: List[str],
+    val_roots: List[str],
+    img_h: int = 60,
+    img_w: int = 240,
+    batch_size: int = 128,
+    epochs: int = 20,
+    lr: float = 1e-3,
+    transform: Optional[str] = None,
+    use_attention: bool = False,
 ):
     set_seed(42)
-    # Prepare alphabet and data loaders
     alphabet = OCRDataset.build_alphabet(
         train_csvs + val_csvs, min_char_freq=1, ignore_case=True
     )
-    num_classes = len(alphabet) + 1
     train_loader, val_loader = create_dataloaders(
-        train_csvs, train_roots, val_csvs, val_roots,
-        alphabet, img_h, img_w, batch_size, 8
+        train_csvs,
+        train_roots,
+        val_csvs,
+        val_roots,
+        alphabet,
+        img_h,
+        img_w,
+        batch_size,
+        num_workers=8,
     )
 
-    # Model, criterion, optimizer, scheduler, scaler
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TRBA(img_h, img_w, num_classes, transform=transform, use_attention=use_attention).to(device)
+    model = TRBA(
+        alphabet=alphabet,
+        img_height=img_h,
+        img_width=img_w,
+        transform=transform,
+        use_attention=use_attention,
+        att_max_length=img_w // 4,
+    ).to(device)
+
     if use_attention:
-        pad_idx = num_classes - 1
-        criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
+        criterion = nn.CrossEntropyLoss(ignore_index=model.PAD_IDX)
     else:
         criterion = nn.CTCLoss(blank=0, zero_infinity=True)
+
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
+    scheduler = lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=2
+    )
     scaler = GradScaler()
 
-    # Directories and writer
-    base_dir = exp_name
-    log_dir = os.path.join(base_dir, "logs")
-    ckpt_dir = os.path.join(base_dir, "checkpoints")
-    os.makedirs(log_dir, exist_ok=True)
-    os.makedirs(ckpt_dir, exist_ok=True)
-    writer = SummaryWriter(log_dir=log_dir)
+    os.makedirs(exp_name, exist_ok=True)
+    writer = SummaryWriter(log_dir=os.path.join(exp_name, "logs"))
 
     best_loss, best_acc = float("inf"), 0.0
     for e in range(1, epochs + 1):
         t_loss, t_acc, t_cer, t_wer = train_epoch(
-            model, train_loader, criterion, optimizer, device, scaler, writer, e, alphabet
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            scaler,
+            writer,
+            e,
+            alphabet,
         )
         v_loss, v_acc, v_cer, v_wer = validate_epoch(
             model, val_loader, criterion, device, writer, e, alphabet
         )
 
+        # лог примеров
         imgs, labs, _, lab_lens = next(iter(val_loader))
-        with torch.no_grad():
-            _, preds, raws, _, truths = infer_batch(
-                model, imgs, labs, lab_lens, alphabet, device, is_train=False
-            )
-        log_samples(e, imgs, lab_lens, preds, raws, truths, writer, n=10, tag="Val/Examples")
+        preds, raws, truths = infer_batch(model, imgs, labs, lab_lens, alphabet, device)
+        log_samples(
+            e, imgs, lab_lens, preds, raws, truths, writer, n=10, tag="Val/Examples"
+        )
 
         print(
             f"[{exp_name}] Epoch {e}/{epochs} "
             f"Train L={t_loss:.4f} Acc={t_acc:.4f} CER={t_cer:.4f} WER={t_wer:.4f} | "
             f"Val L={v_loss:.4f} Acc={v_acc:.4f} CER={v_cer:.4f} WER={v_wer:.4f}"
         )
-        # Save best
+
+        ckpt_dir = os.path.join(exp_name, "checkpoints")
+        os.makedirs(ckpt_dir, exist_ok=True)
         if v_loss < best_loss:
             best_loss = v_loss
             torch.save(model.state_dict(), os.path.join(ckpt_dir, "best_by_loss.pth"))
@@ -204,70 +345,9 @@ def run_experiment(
 
     writer.close()
 
+
 if __name__ == "__main__":
     experiments = [
-        {
-            "exp_name": "exptps_ctc_s",
-            "train_csvs": [r"C:\shared\orig_cyrillic\train.tsv"],
-            "train_roots": [r"C:\shared\orig_cyrillic\train"],
-            "val_csvs": [r"C:\shared\orig_cyrillic\test.tsv"],
-            "val_roots": [r"C:\shared\orig_cyrillic\test"],
-            "use_attention": False,
-            "transform": "tps",
-            "img_h": 32,
-            "img_w": 128
-        },
-        {
-            "exp_name": "exp_ctc_s",
-            "train_csvs": [r"C:\shared\orig_cyrillic\train.tsv"],
-            "train_roots": [r"C:\shared\orig_cyrillic\train"],
-            "val_csvs": [r"C:\shared\orig_cyrillic\test.tsv"],
-            "val_roots": [r"C:\shared\orig_cyrillic\test"],
-            "use_attention": False,
-            "transform": None,
-            "img_h": 32,
-            "img_w": 128
-        },
-        {
-            "exp_name": "exp_attn_s",
-            "train_csvs": [r"C:\shared\orig_cyrillic\train.tsv"],
-            "train_roots": [r"C:\shared\orig_cyrillic\train"],
-            "val_csvs": [r"C:\shared\orig_cyrillic\test.tsv"],
-            "val_roots": [r"C:\shared\orig_cyrillic\test"],
-            "use_attention": True,
-            "transform": None,
-            "img_h": 32,
-            "img_w": 128
-        },
-        {
-            "exp_name": "exptps_atnn_s",
-            "train_csvs": [r"C:\shared\orig_cyrillic\train.tsv"],
-            "train_roots": [r"C:\shared\orig_cyrillic\train"],
-            "val_csvs": [r"C:\shared\orig_cyrillic\test.tsv"],
-            "val_roots": [r"C:\shared\orig_cyrillic\test"],
-            "use_attention": True,
-            "transform": "tps",
-            "img_h": 32,
-            "img_w": 128
-        },
-        {
-            "exp_name": "exptps_ctc_s",
-            "train_csvs": [r"C:\shared\orig_cyrillic\train.tsv"],
-            "train_roots": [r"C:\shared\orig_cyrillic\train"],
-            "val_csvs": [r"C:\shared\orig_cyrillic\test.tsv"],
-            "val_roots": [r"C:\shared\orig_cyrillic\test"],
-            "use_attention": False,
-            "transform": "tps",
-        },
-        {
-            "exp_name": "exp_ctc",
-            "train_csvs": ["C:\shared\orig_cyrillic\train.tsv"],
-            "train_roots": [r"C:\shared\orig_cyrillic\train"],
-            "val_csvs": ["C:\shared\orig_cyrillic\test.tsv"],
-            "val_roots": [r"C:\shared\orig_cyrillic\test"],
-            "use_attention": False,
-            "transform": None,
-        },
         {
             "exp_name": "exp_attn",
             "train_csvs": [r"C:\shared\orig_cyrillic\train.tsv"],
@@ -276,15 +356,6 @@ if __name__ == "__main__":
             "val_roots": [r"C:\shared\orig_cyrillic\test"],
             "use_attention": True,
             "transform": None,
-        },
-        {
-            "exp_name": "exptps_atnn",
-            "train_csvs": [r"C:\shared\orig_cyrillic\train.tsv"],
-            "train_roots": [r"C:\shared\orig_cyrillic\train"],
-            "val_csvs": [r"C:\shared\orig_cyrillic\test.tsv"],
-            "val_roots": [r"C:\shared\orig_cyrillic\test"],
-            "use_attention": True,
-            "transform": "tps",
         },
     ]
 
@@ -297,4 +368,5 @@ if __name__ == "__main__":
             val_roots=cfg["val_roots"],
             transform=cfg.get("transform"),
             use_attention=cfg.get("use_attention", False),
+            batch_size=32,
         )
