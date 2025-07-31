@@ -9,13 +9,17 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim import AdamW
 from torchvision import transforms as T
-
+from utils import log_samples
 from transformers import (
     VisionEncoderDecoderModel,
     TrOCRProcessor,
     get_linear_schedule_with_warmup,
 )
 from metrics import character_error_rate, word_error_rate, compute_accuracy
+import random
+import textwrap
+import numpy as np
+import matplotlib.pyplot as plt
 
 
 def set_seed(seed: int = 42):
@@ -36,8 +40,8 @@ class OCRDataset(Dataset):
         csv_path: str,
         images_dir: str,
         processor: TrOCRProcessor,
-        img_size: Tuple[int, int] = (384, 384),
-        max_target_length: int = 128,
+        img_size: Tuple[int, int] = (240, 60),
+        max_target_length: int = 32,
         ignore_case: bool = True,
         encoding: str = "utf-8",
     ):
@@ -135,6 +139,10 @@ def run_experiment(
     epochs: int = 10,
     lr: float = 5e-5,
 ):
+    """
+    Запуск эксперимента: обучение и валидация модели с логированием в TensorBoard,
+    прогресс-барами и примерами предсказаний.
+    """
     set_seed(42)
     os.makedirs(exp_name, exist_ok=True)
     writer = SummaryWriter(log_dir=os.path.join(exp_name, "logs"))
@@ -148,45 +156,45 @@ def run_experiment(
 
     best_loss = float("inf")
     best_acc = 0.0
-    global_step = 0  # счётчик батчей для логов
+    global_step = 0
 
     for epoch in range(1, epochs + 1):
-        # === TRAIN ===
+        # === TRAINING ===
         model.train()
         train_loss = 0.0
-
-        # оборачиваем loader в tqdm
-        loop = tqdm(train_loader, desc=f"Epoch {epoch} [train]", unit="batch")
-        for batch in loop:
+        train_loop = tqdm(train_loader, desc=f"Epoch {epoch} [train]", unit="batch")
+        for batch in train_loop:
             optimizer.zero_grad()
             pv = batch["pixel_values"].to(device)
             labels = batch["labels"].to(device)
-
             outputs = model(pixel_values=pv, labels=labels)
             loss = outputs.loss
             loss.backward()
-
             optimizer.step()
             scheduler.step()
 
             train_loss += loss.item()
-            # логируем лосс на каждом шаге
             writer.add_scalar("train/loss_step", loss.item(), global_step)
             global_step += 1
-
-            # обновляем прогресс-бар
-            loop.set_postfix(batch_loss=loss.item())
+            train_loop.set_postfix(batch_loss=loss.item())
 
         avg_train_loss = train_loss / len(train_loader)
         writer.add_scalar("train/loss_epoch", avg_train_loss, epoch)
 
         # === VALIDATION ===
+        torch.cuda.empty_cache()
         model.eval()
         val_loss = 0.0
         hyps, refs = [], []
+
+        # Prepare a sample batch for logging
+        sample_batch = next(iter(val_loader))
+        sample_pixels = sample_batch["pixel_values"].to(device)
+        sample_raws = sample_batch["raw_labels"]
+
+        val_loop = tqdm(val_loader, desc=f"Epoch {epoch} [val]", unit="batch")
         with torch.no_grad():
-            loop = tqdm(val_loader, desc=f"Epoch {epoch} [val]", unit="batch")
-            for batch in loop:
+            for batch in val_loop:
                 pv = batch["pixel_values"].to(device)
                 labels = batch["labels"].to(device)
                 raw = batch["raw_labels"]
@@ -194,15 +202,15 @@ def run_experiment(
                 out = model(pixel_values=pv, labels=labels)
                 val_loss += out.loss.item()
 
-                # generate predictions
                 gen_ids = model.generate(
-                    pv, max_length=processor.tokenizer.model_max_length
+                    pv,
+                    max_length=32,
+                    use_cache=False,
                 )
                 preds = processor.batch_decode(gen_ids, skip_special_tokens=True)
                 hyps.extend(preds)
                 refs.extend(raw)
-
-                loop.set_postfix(batch_loss=out.loss.item())
+                val_loop.set_postfix(batch_loss=out.loss.item())
 
         avg_val_loss = val_loss / len(val_loader)
         acc = compute_accuracy(refs, hyps)
@@ -214,14 +222,39 @@ def run_experiment(
         writer.add_scalar("val/cer", cer, epoch)
         writer.add_scalar("val/wer", wer, epoch)
 
+        # Log sample predictions to TensorBoard
+        sample_gen_ids = model.generate(
+            sample_pixels,
+            max_length=32,
+            use_cache=False,
+        )
+        sample_preds = processor.batch_decode(sample_gen_ids, skip_special_tokens=True)
+        # compute lengths of the ground‐truth strings
+        # получаем тензор с id, восстанавливаем pad-токен там, где стоит -100
+        labels = sample_batch["labels"].clone()
+        labels[labels == -100] = processor.tokenizer.pad_token_id
+
+        # декодируем в список строк
+        truths = processor.batch_decode(labels, skip_special_tokens=True)
+        imgs_cpu = sample_pixels.cpu().mean(dim=1, keepdim=True)
+        log_samples(
+            epoch=epoch,
+            imgs=imgs_cpu,
+            lab_lens=[len(s) for s in truths],
+            preds=sample_preds,
+            raws=sample_raws,  # raw_labels по-прежнему для визуализации
+            truths=truths,  # а здесь распакованные из токенов
+            writer=writer,
+            n=5,
+            tag="Val Examples",
+        )
+        # Print metrics and save best checkpoints
         print(
             f"[{exp_name}] Epoch {epoch}/{epochs} "
             f"train_loss={avg_train_loss:.4f} "
             f"val_loss={avg_val_loss:.4f} "
             f"acc={acc:.4f} cer={cer:.4f} wer={wer:.4f}"
         )
-
-        # save best
         ckpt_dir = os.path.join(exp_name, "checkpoints")
         os.makedirs(ckpt_dir, exist_ok=True)
         if avg_val_loss < best_loss:
@@ -238,16 +271,18 @@ def run_experiment(
 
 if __name__ == "__main__":
     exp_name = "trocr_experiment"
-    train_csvs = [r"C:\shared\orig_cyrillic\train.tsv"]
-    train_dirs = [r"C:\shared\orig_cyrillic\train"]
+    train_csvs = [r"C:\shared\orig_cyrillic\test.tsv"]
+    train_dirs = [r"C:\shared\orig_cyrillic\test"]
     val_csvs = [r"C:\shared\orig_cyrillic\test.tsv"]
     val_dirs = [r"C:\shared\orig_cyrillic\test"]
 
     # Включаем use_fast=True
     processor = TrOCRProcessor.from_pretrained(
-        "microsoft/trocr-base-printed", use_fast=True
+        "microsoft/trocr-small-handwritten", use_fast=True
     )
-    model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-printed")
+    model = VisionEncoderDecoderModel.from_pretrained(
+        "microsoft/trocr-small-handwritten"
+    )
 
     # Задаём специальные токены в конфиге модели
     model.config.decoder_start_token_id = processor.tokenizer.cls_token_id
@@ -266,7 +301,7 @@ if __name__ == "__main__":
         val_csvs,
         val_dirs,
         processor,
-        batch_size=2,
+        batch_size=8,
         num_workers=4,
     )
 
