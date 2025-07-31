@@ -351,7 +351,7 @@ def run_experiment(
 if __name__ == "__main__":
     experiments = [
         {
-            "exp_name": "exp_attn",
+            "exp_name": "exp_attn_v3",
             "train_csvs": [r"C:\shared\orig_cyrillic\train.tsv"],
             "train_roots": [r"C:\shared\orig_cyrillic\train"],
             "val_csvs": [r"C:\shared\orig_cyrillic\test.tsv"],
