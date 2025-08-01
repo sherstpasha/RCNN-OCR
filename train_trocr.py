@@ -40,8 +40,8 @@ class OCRDataset(Dataset):
         csv_path: str,
         images_dir: str,
         processor: TrOCRProcessor,
-        img_size: Tuple[int, int] = (240, 60),
-        max_target_length: int = 32,
+        img_size: Tuple[int, int] = (384, 384),
+        max_target_length: int = 128,
         ignore_case: bool = True,
         encoding: str = "utf-8",
     ):
@@ -75,15 +75,19 @@ class OCRDataset(Dataset):
         image = Image.open(path).convert("RGB")
         pixel_values = self.transform(image)
 
-        tok = self.processor.tokenizer(
-            label,
+        # Правильная токенизация с добавлением BOS/EOS
+        encoded = self.processor(
+            text=label,
             padding="max_length",
             truncation=True,
             max_length=self.max_target_length,
             return_tensors="pt",
+            add_special_tokens=True,  # добавляем <bos> и <eos>
         )
-        labels = tok.input_ids.squeeze()
-        labels[labels == self.processor.tokenizer.pad_token_id] = -100
+        labels = encoded.input_ids.squeeze()
+        labels[labels == self.processor.tokenizer.pad_token_id] = (
+            -100
+        )  # маскирование падов
 
         return pixel_values, labels, label
 
@@ -271,26 +275,30 @@ def run_experiment(
 
 if __name__ == "__main__":
     exp_name = "trocr_experiment"
-    train_csvs = [r"C:\shared\orig_cyrillic\test.tsv"]
-    train_dirs = [r"C:\shared\orig_cyrillic\test"]
+    train_csvs = [r"C:\shared\orig_cyrillic\train.tsv"]
+    train_dirs = [r"C:\shared\orig_cyrillic\train"]
     val_csvs = [r"C:\shared\orig_cyrillic\test.tsv"]
     val_dirs = [r"C:\shared\orig_cyrillic\test"]
 
-    # Включаем use_fast=True
-    processor = TrOCRProcessor.from_pretrained(
-        "microsoft/trocr-small-handwritten", use_fast=True
-    )
+    processor = TrOCRProcessor.from_pretrained("microsoft/trocr-small-handwritten")
     model = VisionEncoderDecoderModel.from_pretrained(
         "microsoft/trocr-small-handwritten"
     )
 
-    # Задаём специальные токены в конфиге модели
-    model.config.decoder_start_token_id = processor.tokenizer.cls_token_id
-    model.config.eos_token_id = processor.tokenizer.sep_token_id
+    # === ВАЖНО: правильно установить токены ===
+    model.config.decoder_start_token_id = processor.tokenizer.bos_token_id
+    model.config.eos_token_id = processor.tokenizer.eos_token_id
     model.config.pad_token_id = processor.tokenizer.pad_token_id
 
-    # (Опционально) Установим размер словаря декодера, чтобы увязать его с токенизатором
-    model.config.vocab_size = model.config.decoder.vocab_size
+    # === (Опционально, но безопасно): обновить размер словаря
+    model.decoder.resize_token_embeddings(len(processor.tokenizer))
+
+    # === Установка длины декодера
+    model.config.max_length = 32  # т.к. короткие строки
+    model.config.early_stopping = True
+    model.config.no_repeat_ngram_size = 0
+    model.config.length_penalty = 1.0
+    model.config.num_beams = 1  # можно увеличить позже
 
     set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
