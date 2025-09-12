@@ -12,4 +12,4 @@ python-Levenshtein>=0.12.0
 jiwer>=2.3.0
 tensorboard>=2.4.0
 matplotlib>=3.3.0
-pyctcdecode
+tqdm
