@@ -56,6 +56,8 @@ Thumbs.db
 runs/
 checkpoints/
 *.pth
+*.json
+*.db
 events.out.tfevents.*
 
 # Coverage reports

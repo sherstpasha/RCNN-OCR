@@ -8,9 +8,11 @@ from torch.utils.data import Dataset
 import torch.nn.functional as F
 import numpy as np
 import torchvision.transforms.functional as TF
+import albumentations as A
+import cv2
 
 
-def build_alphabet(paths, min_char_freq=1, encoding="utf-8", case_insensitive=True):
+def build_alphabet(paths, min_char_freq=1, encoding="utf-8", case_insensitive=False):
     ctr = Counter()
     for p in paths:
         with open(p, newline="", encoding=encoding) as f:
@@ -26,23 +28,22 @@ def build_alphabet(paths, min_char_freq=1, encoding="utf-8", case_insensitive=Tr
     return symbols, char2idx, idx2char
 
 
-class ResizeAndPad:
-    def __init__(self, img_h=32, img_w=256, fill=1.0):
+class ResizeAndPadA(A.ImageOnlyTransform):
+    def __init__(self, img_h=32, img_w=256, always_apply=True, p=1.0):
+        super().__init__(always_apply, p)
         self.img_h = img_h
         self.img_w = img_w
-        self.fill = fill
 
-    def __call__(self, img):
-        # img = PIL.Image
-        w, h = img.size
+    def apply(self, img, **params):
+        h, w = img.shape[:2]
         new_w = min(self.img_w, max(1, int(w * self.img_h / h)))
-        img = img.resize((new_w, self.img_h), Image.BILINEAR)
+        img_resized = cv2.resize(
+            img, (new_w, self.img_h), interpolation=cv2.INTER_LINEAR
+        )
 
-        tensor = TF.to_tensor(img)  # [0..1]
-        pad_w = self.img_w - tensor.shape[-1]
-        if pad_w > 0:
-            tensor = F.pad(tensor, (0, pad_w, 0, 0), value=self.fill)
-        return tensor
+        canvas = np.ones((self.img_h, self.img_w, 3), dtype=img.dtype) * 255
+        canvas[:, :new_w] = img_resized
+        return canvas
 
 
 class OCRDataset(Dataset):
@@ -77,7 +78,8 @@ class OCRDataset(Dataset):
         img = Image.open(os.path.join(self.images_dir, fname)).convert("RGB")
 
         if self.transform:
-            tensor = self.transform(img)
+            augmented = self.transform(image=np.array(img))
+            tensor = augmented["image"]
         else:
             tensor = (
                 torch.from_numpy(np.array(img, dtype=np.float32)).permute(2, 0, 1)
