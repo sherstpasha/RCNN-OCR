@@ -36,20 +36,24 @@ def set_seed(seed: int = 42):
 def get_train_transform(params, img_h, img_w, from_trial=True):
     def suggest(name, default):
         if from_trial:
-            # params = trial
-            if isinstance(default, tuple) and len(default) == 2:
+            # --- Optuna trial ---
+            if isinstance(default, tuple) and len(default) == 3:
+                lo, hi, step = default
+                return params.suggest_int(name, lo, hi, step=step)
+            elif isinstance(default, tuple) and len(default) == 2:
                 lo, hi = default
                 if isinstance(lo, int) and isinstance(hi, int):
                     return params.suggest_int(name, lo, hi)
                 elif isinstance(lo, float) or isinstance(hi, float):
-                    return params.suggest_uniform(name, lo, hi)
+                    return params.suggest_float(name, lo, hi)
             else:
                 return params.suggest_categorical(name, default)
         else:
-            # params = dict
-            return params.get(
-                name, default[0] if isinstance(default, tuple) else default
-            )
+            # --- dict из best_params.json ---
+            if isinstance(default, tuple):
+                return params.get(name, default[0])
+            else:
+                return params.get(name, default)
 
     return A.Compose(
         [
@@ -73,9 +77,7 @@ def get_train_transform(params, img_h, img_w, from_trial=True):
                 p=suggest("p_GridDistortion", (0.0, 0.5)),
             ),
             A.MotionBlur(
-                blur_limit=params.suggest_int(
-                    "motion_blur_limit", 3, 7, step=2
-                ),  # 3, 5, 7
+                blur_limit=suggest("motion_blur_limit", (3, 7, 2)),  # шаг 2 → {3,5,7}
                 p=suggest("p_MotionBlur", (0.0, 0.5)),
             ),
             A.GaussNoise(
@@ -324,7 +326,7 @@ def run_training(
 # Main
 # ============================================================
 if __name__ == "__main__":
-    mode = "optuna"
+    mode = "train"
 
     # === фиксированные параметры проекта ===
     IMG_H = 64
