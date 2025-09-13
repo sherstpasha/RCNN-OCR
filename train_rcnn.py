@@ -350,7 +350,7 @@ if __name__ == "__main__":
 
         def objective(trial):
             lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
-            batch_size = trial.suggest_categorical("batch_size", [64, 128, 256])
+            batch_size = trial.suggest_categorical("batch_size", [256])
             optimizer_name = trial.suggest_categorical(
                 "optimizer", ["Adam", "AdamW", "SGD"]
             )
@@ -358,7 +358,7 @@ if __name__ == "__main__":
                 "scheduler", ["ReduceLROnPlateau", "CosineAnnealingLR", "None"]
             )
             weight_decay = trial.suggest_loguniform("weight_decay", 1e-6, 1e-2)
-            momentum = trial.suggest_float("momentum", 0.7, 0.99)
+            momentum = trial.suggest_float("momentum", 0.7, 0.999)
 
             train_transform = get_train_transform(
                 trial, img_h=IMG_H, img_w=IMG_W, from_trial=True
