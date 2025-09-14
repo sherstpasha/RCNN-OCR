@@ -15,7 +15,7 @@ from albumentations.pytorch import ToTensorV2
 from dataset import OCRDataset, build_alphabet, ResizeAndPadA
 from model import RCNN
 from utils import decode
-from metrics import compute_accuracy
+from metrics import compute_accuracy, word_error_rate, character_error_rate
 
 
 # ============================================================
@@ -36,11 +36,7 @@ def set_seed(seed: int = 42):
 def get_train_transform(params, img_h, img_w, from_trial=True):
     def suggest(name, default):
         if from_trial:
-            # --- Optuna trial ---
-            if isinstance(default, tuple) and len(default) == 3:
-                lo, hi, step = default
-                return params.suggest_int(name, lo, hi, step=step)
-            elif isinstance(default, tuple) and len(default) == 2:
+            if isinstance(default, tuple) and len(default) == 2:
                 lo, hi = default
                 if isinstance(lo, int) and isinstance(hi, int):
                     return params.suggest_int(name, lo, hi)
@@ -49,7 +45,6 @@ def get_train_transform(params, img_h, img_w, from_trial=True):
             else:
                 return params.suggest_categorical(name, default)
         else:
-            # --- dict из best_params.json ---
             if isinstance(default, tuple):
                 return params.get(name, default[0])
             else:
@@ -60,55 +55,16 @@ def get_train_transform(params, img_h, img_w, from_trial=True):
             ResizeAndPadA(img_h=img_h, img_w=img_w),
             A.ShiftScaleRotate(
                 shift_limit=suggest("shift_limit", (0.0, 0.05)),
-                scale_limit=suggest("scale_limit", (0.0, 0.2)),
-                rotate_limit=suggest("rotate_limit", (0, 10)),
+                scale_limit=suggest("scale_limit", (0.0, 0.1)),
+                rotate_limit=suggest("rotate_limit", (0, 5)),
                 border_mode=0,
                 value=(255, 255, 255),
-                p=suggest("p_ShiftScaleRotate", (0.0, 0.7)),
-            ),
-            A.OpticalDistortion(
-                distort_limit=suggest("optical_distort_limit", (0.0, 0.05)),
-                shift_limit=suggest("optical_shift_limit", (0.0, 0.05)),
-                p=suggest("p_OpticalDistortion", (0.0, 0.5)),
-            ),
-            A.GridDistortion(
-                num_steps=5,
-                distort_limit=suggest("grid_distort_limit", (0.0, 0.05)),
-                p=suggest("p_GridDistortion", (0.0, 0.5)),
-            ),
-            A.MotionBlur(
-                blur_limit=suggest("motion_blur_limit", (3, 7, 2)),  # шаг 2 → {3,5,7}
-                p=suggest("p_MotionBlur", (0.0, 0.5)),
-            ),
-            A.GaussNoise(
-                var_limit=(
-                    suggest("noise_var_min", (5, 20)),
-                    suggest("noise_var_max", (30, 80)),
-                ),
-                p=suggest("p_GaussNoise", (0.0, 0.5)),
-            ),
-            A.ImageCompression(
-                quality_lower=suggest("jpeg_qmin", (30, 60)),
-                quality_upper=suggest("jpeg_qmax", (70, 100)),
-                p=suggest("p_ImageCompression", (0.0, 0.5)),
-            ),
-            A.CoarseDropout(
-                max_holes=suggest("dropout_holes", (1, 5)),
-                max_height=suggest("dropout_h", (5, 20)),
-                max_width=suggest("dropout_w", (5, 20)),
-                p=suggest("p_CoarseDropout", (0.0, 0.5)),
+                p=suggest("p_ShiftScaleRotate", (0.0, 0.5)),
             ),
             A.RandomBrightnessContrast(
-                brightness_limit=suggest("brightness_limit", (0.1, 0.5)),
-                contrast_limit=suggest("contrast_limit", (0.1, 0.5)),
+                brightness_limit=suggest("brightness_limit", (0.1, 0.3)),
+                contrast_limit=suggest("contrast_limit", (0.1, 0.3)),
                 p=suggest("p_BrightnessContrast", (0.0, 0.5)),
-            ),
-            A.ToGray(p=suggest("p_ToGray", (0.0, 0.3))),
-            A.ElasticTransform(
-                alpha=suggest("elastic_alpha", (0.5, 2.0)),
-                sigma=suggest("elastic_sigma", (20, 80)),
-                alpha_affine=suggest("elastic_affine", (5, 15)),
-                p=suggest("p_ElasticTransform", (0.0, 0.3)),
             ),
             A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
             ToTensorV2(),
@@ -149,6 +105,7 @@ def run_training(
     min_char_freq=3,
     encoding="utf-8",
     train_transform=None,
+    trial=None,
 ):
     set_seed(42)
     device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -178,8 +135,8 @@ def run_training(
     best_loss_path = os.path.join(f"exp{exp_idx}", "best_loss.pth")
     best_acc_path = os.path.join(f"exp{exp_idx}", "best_acc.pth")
 
-    # model
-    model = RCNN(num_classes=num_classes, pretrained=True).to(device)
+    # model (только ResNet31 backbone)
+    model = RCNN(num_classes=num_classes).to(device)
     criterion = nn.CTCLoss(blank=0, zero_infinity=True)
 
     # optimizer
@@ -300,10 +257,18 @@ def run_training(
 
         avg_val_loss = total_val_loss / len(val_loader)
         val_acc = compute_accuracy(refs, hyps)
+        val_cer, val_wer = 0.0, 0.0
+        for r, h in zip(refs, hyps):
+            val_cer += character_error_rate(r, h)
+            val_wer += word_error_rate(r, h)
+        val_cer /= len(refs)
+        val_wer /= len(refs)
 
         writer.add_scalar("Loss/train_epoch", avg_train_loss, epoch)
         writer.add_scalar("Loss/val_epoch", avg_val_loss, epoch)
         writer.add_scalar("Accuracy/val", val_acc, epoch)
+        writer.add_scalar("CER/val", val_cer, epoch)
+        writer.add_scalar("WER/val", val_wer, epoch)
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
@@ -318,6 +283,12 @@ def run_training(
             else:
                 scheduler.step()
 
+        if trial is not None:
+            trial.report(avg_val_loss, step=epoch)
+            if trial.should_prune():
+                writer.close()
+                raise optuna.TrialPruned()
+
     writer.close()
     return {"val_acc": best_val_acc, "val_loss": best_val_loss}
 
@@ -326,9 +297,8 @@ def run_training(
 # Main
 # ============================================================
 if __name__ == "__main__":
-    mode = "train"
+    mode = "optuna"
 
-    # === фиксированные параметры проекта ===
     IMG_H = 64
     IMG_W = 256
 
@@ -352,7 +322,7 @@ if __name__ == "__main__":
 
         def objective(trial):
             lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
-            batch_size = trial.suggest_categorical("batch_size", [256])
+            batch_size = trial.suggest_categorical("batch_size", [64])
             optimizer_name = trial.suggest_categorical(
                 "optimizer", ["Adam", "AdamW", "SGD"]
             )
@@ -369,14 +339,16 @@ if __name__ == "__main__":
             metrics = run_training(
                 **base_config,
                 batch_size=batch_size,
-                epochs=5,
+                epochs=15,
                 lr=lr,
                 optimizer_name=optimizer_name,
                 scheduler_name=scheduler_name,
                 weight_decay=weight_decay,
                 momentum=momentum,
                 train_transform=train_transform,
+                trial=trial,
             )
+
             return -metrics["val_loss"]
 
         study = optuna.create_study(
@@ -384,6 +356,7 @@ if __name__ == "__main__":
             direction="maximize",
             storage=storage_url,
             load_if_exists=True,
+            pruner=optuna.pruners.MedianPruner(n_warmup_steps=10),
         )
         study.optimize(objective, n_trials=15)
 

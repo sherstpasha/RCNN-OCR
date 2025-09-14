@@ -1,47 +1,44 @@
+import torch
 import torch.nn as nn
-from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
+from resnet31 import ResNet31
 
 
-class EfficientNetBackbone(nn.Module):
-
-    def __init__(self, pretrained: bool = True):
+class BidirectionalLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
         super().__init__()
-        weights = EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
-        net = efficientnet_b0(weights=weights)
-
-        self.feature_extractor = net.features
-        self.out_channels = net.classifier[1].in_features
+        self.rnn = nn.LSTM(
+            input_size, hidden_size, bidirectional=True, batch_first=True
+        )
+        self.linear = nn.Linear(hidden_size * 2, output_size)
 
     def forward(self, x):
-        return self.feature_extractor(x)
+        # x: [B, T, input_size]
+        self.rnn.flatten_parameters()
+        recurrent, _ = self.rnn(x)  # [B, T, 2*hidden_size]
+        output = self.linear(recurrent)  # [B, T, output_size]
+        return output
 
 
 class RCNN(nn.Module):
-    def __init__(
-        self, num_classes: int, hidden_size: int = 256, pretrained: bool = True
-    ):
+    def __init__(self, num_classes, hidden_size=256):
         super().__init__()
-        self.cnn = EfficientNetBackbone(pretrained=pretrained)
 
+        self.cnn = ResNet31(in_channels=3, out_channels=512)
         self.pool = nn.AdaptiveAvgPool2d((1, None))
 
-        self.rnn = nn.LSTM(
-            input_size=self.cnn.out_channels,
-            hidden_size=hidden_size,
-            num_layers=2,
-            bidirectional=True,
-            batch_first=True,
+        self.rnn = nn.Sequential(
+            BidirectionalLSTM(self.cnn.out_channels, hidden_size, hidden_size),
+            BidirectionalLSTM(hidden_size, hidden_size, num_classes),
         )
 
-        self.fc = nn.Linear(hidden_size * 2, num_classes)
-
     def forward(self, x):
+        # CNN features
         f = self.cnn(x)  # [B, C, H, W]
         f = self.pool(f)  # [B, C, 1, W]
         f = f.squeeze(2).permute(0, 2, 1)  # [B, W, C]
 
-        r, _ = self.rnn(f)  # [B, W, 2*hidden]
+        # RNN features
+        out = self.rnn(f)  # [B, W, num_classes]
 
-        # CTC logits
-        logits = self.fc(r)  # [B, W, num_classes]
-        return logits.permute(1, 0, 2)  # [T, B, C] для CTC
+        # For CTC: [T, B, C]
+        return out.permute(1, 0, 2)
