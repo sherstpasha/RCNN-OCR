@@ -349,19 +349,74 @@ if __name__ == "__main__":
                 trial=trial,
             )
 
-            return metrics["val_acc"]
+            # мы оптимизируем CER → минимизация
+            return metrics["val_cer"]
 
         study = optuna.create_study(
             study_name="ocr_tuning",
-            direction="maximize",
+            direction="minimize",  # минимизируем CER
             storage=storage_url,
             load_if_exists=True,
             pruner=optuna.pruners.MedianPruner(n_warmup_steps=10),
         )
-        study.optimize(objective, n_trials=15)
+
+        # === 5 стартовых комбинаций ===
+        study.enqueue_trial(
+            {
+                "lr": 7e-4,
+                "batch_size": 64,
+                "optimizer": "Adam",
+                "scheduler": "None",
+                "weight_decay": 0.0,
+                "momentum": 0.9,
+            }
+        )
+        study.enqueue_trial(
+            {
+                "lr": 5e-5,
+                "batch_size": 64,
+                "optimizer": "AdamW",
+                "scheduler": "CosineAnnealingLR",
+                "weight_decay": 1e-3,
+                "momentum": 0.95,
+            }
+        )
+        study.enqueue_trial(
+            {
+                "lr": 3e-4,
+                "batch_size": 64,
+                "optimizer": "Adam",
+                "scheduler": "CosineAnnealingLR",
+                "weight_decay": 1e-5,
+                "momentum": 0.9,
+            }
+        )
+        study.enqueue_trial(
+            {
+                "lr": 1e-3,
+                "batch_size": 64,
+                "optimizer": "SGD",
+                "scheduler": "ReduceLROnPlateau",
+                "weight_decay": 1e-4,
+                "momentum": 0.98,
+            }
+        )
+        study.enqueue_trial(
+            {
+                "lr": 1e-4,
+                "batch_size": 64,
+                "optimizer": "AdamW",
+                "scheduler": "ReduceLROnPlateau",
+                "weight_decay": 1e-4,
+                "momentum": 0.92,
+            }
+        )
+
+        # запустим только эти 5
+        study.optimize(objective, n_trials=5)
 
         print("Лучшие параметры:", study.best_params)
-        print("Лучший результат:", study.best_value)
+        print("Лучший результат (CER):", study.best_value)
 
         with open("best_params.json", "w", encoding="utf-8") as f:
             json.dump(study.best_params, f, indent=4, ensure_ascii=False)
