@@ -349,7 +349,7 @@ if __name__ == "__main__":
                 trial=trial,
             )
 
-            return -metrics["val_loss"]
+            return metrics["val_acc"]
 
         study = optuna.create_study(
             study_name="ocr_tuning",
