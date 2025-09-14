@@ -349,18 +349,21 @@ if __name__ == "__main__":
                 trial=trial,
             )
 
-            # мы оптимизируем CER → минимизация
-            return metrics["val_cer"]
+            # === Оптимизируем точность ===
+            return metrics["val_acc"]
+
+        from optuna.samplers import TPESampler
 
         study = optuna.create_study(
             study_name="ocr_tuning",
-            direction="minimize",  # минимизируем CER
+            direction="maximize",  # мы хотим максимизировать accuracy
             storage=storage_url,
             load_if_exists=True,
+            sampler=TPESampler(multivariate=True, n_startup_trials=0),
             pruner=optuna.pruners.MedianPruner(n_warmup_steps=10),
         )
 
-        # === 5 стартовых комбинаций ===
+        # --- 5 стартовых комбинаций ---
         study.enqueue_trial(
             {
                 "lr": 7e-4,
@@ -412,11 +415,11 @@ if __name__ == "__main__":
             }
         )
 
-        # запустим только эти 5
-        study.optimize(objective, n_trials=5)
+        # --- 25 трейлов (5 фикс + 20 с TPE) ---
+        study.optimize(objective, n_trials=25)
 
         print("Лучшие параметры:", study.best_params)
-        print("Лучший результат (CER):", study.best_value)
+        print("Лучший результат (Accuracy):", study.best_value)
 
         with open("best_params.json", "w", encoding="utf-8") as f:
             json.dump(study.best_params, f, indent=4, ensure_ascii=False)
