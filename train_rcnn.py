@@ -297,7 +297,7 @@ def run_training(
 # Main
 # ============================================================
 if __name__ == "__main__":
-    mode = "optuna"
+    mode = "train"
 
     IMG_H = 64
     IMG_W = 256
@@ -363,57 +363,7 @@ if __name__ == "__main__":
             pruner=optuna.pruners.MedianPruner(n_warmup_steps=10),
         )
 
-        # --- 5 стартовых комбинаций ---
-        study.enqueue_trial(
-            {
-                "lr": 7e-4,
-                "batch_size": 64,
-                "optimizer": "Adam",
-                "scheduler": "None",
-                "weight_decay": 0.0,
-                "momentum": 0.9,
-            }
-        )
-        study.enqueue_trial(
-            {
-                "lr": 5e-5,
-                "batch_size": 64,
-                "optimizer": "AdamW",
-                "scheduler": "CosineAnnealingLR",
-                "weight_decay": 1e-3,
-                "momentum": 0.95,
-            }
-        )
-        study.enqueue_trial(
-            {
-                "lr": 3e-4,
-                "batch_size": 64,
-                "optimizer": "Adam",
-                "scheduler": "CosineAnnealingLR",
-                "weight_decay": 1e-5,
-                "momentum": 0.9,
-            }
-        )
-        study.enqueue_trial(
-            {
-                "lr": 1e-3,
-                "batch_size": 64,
-                "optimizer": "SGD",
-                "scheduler": "ReduceLROnPlateau",
-                "weight_decay": 1e-4,
-                "momentum": 0.98,
-            }
-        )
-        study.enqueue_trial(
-            {
-                "lr": 1e-4,
-                "batch_size": 64,
-                "optimizer": "AdamW",
-                "scheduler": "ReduceLROnPlateau",
-                "weight_decay": 1e-4,
-                "momentum": 0.92,
-            }
-        )
+
 
         # --- 25 трейлов (5 фикс + 20 с TPE) ---
         study.optimize(objective, n_trials=25)
@@ -438,7 +388,7 @@ if __name__ == "__main__":
         run_training(
             **base_config,
             batch_size=best_params.get("batch_size", 128),
-            epochs=50,
+            epochs=100,
             lr=best_params.get("lr", 1e-4),
             optimizer_name=best_params.get("optimizer", "Adam"),
             scheduler_name=best_params.get("scheduler", "ReduceLROnPlateau"),
