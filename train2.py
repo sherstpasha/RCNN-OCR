@@ -32,7 +32,9 @@ def set_seed(seed: int = 42):
 def get_train_transform(params, img_h, img_w):
     def suggest(name, default):
         if isinstance(default, tuple):
-            return params.get(name, default[0]) if isinstance(params, dict) else default[0]
+            return (
+                params.get(name, default[0]) if isinstance(params, dict) else default[0]
+            )
         else:
             return params.get(name, default) if isinstance(params, dict) else default
 
@@ -99,10 +101,14 @@ def save_checkpoint(
     }
     torch.save(ckpt, path)
 
+
 def save_weights(path, model):
     torch.save(model.state_dict(), path)
 
-def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None, map_location="auto"):
+
+def load_checkpoint(
+    path, model, optimizer=None, scheduler=None, scaler=None, map_location="auto"
+):
     if map_location == "auto":
         map_location = "cuda" if torch.cuda.is_available() else "cpu"
     ckpt = torch.load(path, map_location=map_location)
@@ -133,7 +139,7 @@ def run_training(
     train_roots,
     val_csvs,
     val_roots,
-    charset_path,                
+    charset_path,
     img_h=64,
     img_w=256,
     batch_size=32,
@@ -145,7 +151,7 @@ def run_training(
     momentum=0.9,
     device="cuda",
     encoding="utf-8",
-    max_len=25,                  
+    max_len=25,
     train_transform=None,
     exp_dir=None,
     resume_path=None,
@@ -172,18 +178,24 @@ def run_training(
     best_acc_path = os.path.join(exp_dir, "best_acc_ckpt.pth")
     last_path = os.path.join(exp_dir, "last_ckpt.pth")
     best_loss_weights_path = os.path.join(exp_dir, "best_loss_weights.pth")
-    best_acc_weights_path  = os.path.join(exp_dir, "best_acc_weights.pth")
-    last_weights_path      = os.path.join(exp_dir, "last_weights.pth")
+    best_acc_weights_path = os.path.join(exp_dir, "best_acc_weights.pth")
+    last_weights_path = os.path.join(exp_dir, "last_weights.pth")
 
     # --- charset ---
     itos, stoi = load_charset(charset_path)
-    PAD = stoi["<PAD>"]; SOS = stoi["<SOS>"]; EOS = stoi["<EOS>"]; BLANK = stoi.get("<BLANK>", None)
+    PAD = stoi["<PAD>"]
+    SOS = stoi["<SOS>"]
+    EOS = stoi["<EOS>"]
+    BLANK = stoi.get("<BLANK>", None)
     num_classes = len(itos)
 
     model = RCNN(
         num_classes=num_classes,
         hidden_size=256,
-        sos_id=SOS, eos_id=EOS, pad_id=PAD, blank_id=BLANK,
+        sos_id=SOS,
+        eos_id=EOS,
+        pad_id=PAD,
+        blank_id=BLANK,
     ).to(device)
 
     criterion = nn.CrossEntropyLoss(ignore_index=PAD)
@@ -194,13 +206,17 @@ def run_training(
     elif optimizer_name == "AdamW":
         optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     elif optimizer_name == "SGD":
-        optimizer = optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+        optimizer = optim.SGD(
+            model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay
+        )
     else:
         raise ValueError(f"Unknown optimizer: {optimizer_name}")
 
     # scheduler
     if scheduler_name == "ReduceLROnPlateau":
-        scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3, verbose=False, min_lr=1e-7)
+        scheduler = ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=3, verbose=False, min_lr=1e-7
+        )
     elif scheduler_name == "CosineAnnealingLR":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     elif scheduler_name == "None":
@@ -215,27 +231,49 @@ def run_training(
 
     train_sets = [
         OCRDatasetAttn(
-            c, r, stoi, img_height=img_h, img_max_width=img_w,
-            transform=train_transform, encoding=encoding
+            c,
+            r,
+            stoi,
+            img_height=img_h,
+            img_max_width=img_w,
+            transform=train_transform,
+            encoding=encoding,
         )
         for c, r in zip(train_csvs, train_roots)
     ]
     val_sets = [
         OCRDatasetAttn(
-            c, r, stoi, img_height=img_h, img_max_width=img_w,
-            transform=val_transform, encoding=encoding
+            c,
+            r,
+            stoi,
+            img_height=img_h,
+            img_max_width=img_w,
+            transform=val_transform,
+            encoding=encoding,
         )
         for c, r in zip(val_csvs, val_roots)
     ]
 
-    collate_train = OCRDatasetAttn.make_collate_attn(stoi, max_len=max_len, drop_blank=True)
-    collate_val   = OCRDatasetAttn.make_collate_attn(stoi, max_len=max_len, drop_blank=True)
+    collate_train = OCRDatasetAttn.make_collate_attn(
+        stoi, max_len=max_len, drop_blank=True
+    )
+    collate_val = OCRDatasetAttn.make_collate_attn(
+        stoi, max_len=max_len, drop_blank=True
+    )
 
     train_loader = DataLoader(
-        ConcatDataset(train_sets), batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=collate_train
+        ConcatDataset(train_sets),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=collate_train,
     )
     val_loader = DataLoader(
-        ConcatDataset(val_sets), batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate_val
+        ConcatDataset(val_sets),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_val,
     )
 
     # resume logic
@@ -245,7 +283,9 @@ def run_training(
     writer = SummaryWriter(log_dir=log_dir)
 
     if resume_path is not None and os.path.isfile(resume_path):
-        ckpt = load_checkpoint(resume_path, model, optimizer=optimizer, scheduler=scheduler, scaler=scaler)
+        ckpt = load_checkpoint(
+            resume_path, model, optimizer=optimizer, scheduler=scheduler, scaler=scaler
+        )
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         global_step = int(ckpt.get("global_step", 0))
         best_val_loss = float(ckpt.get("best_val_loss", best_val_loss))
@@ -263,8 +303,12 @@ def run_training(
 
             optimizer.zero_grad(set_to_none=True)
             with amp.autocast():
-                logits = model(imgs, text=text_in, is_train=True, batch_max_length=max_len)  # [B, T, V]
-                loss = criterion(logits.reshape(-1, logits.size(-1)), target_y.reshape(-1))
+                logits = model(
+                    imgs, text=text_in, is_train=True, batch_max_length=max_len
+                )  # [B, T, V]
+                loss = criterion(
+                    logits.reshape(-1, logits.size(-1)), target_y.reshape(-1)
+                )
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -288,26 +332,40 @@ def run_training(
 
                 with amp.autocast():
                     # лосс на teacher forcing
-                    logits_tf = model(imgs, text=text_in, is_train=True, batch_max_length=max_len)  # [B,T,V]
-                    val_loss = criterion(logits_tf.reshape(-1, logits_tf.size(-1)), target_y.reshape(-1))
+                    logits_tf = model(
+                        imgs, text=text_in, is_train=True, batch_max_length=max_len
+                    )  # [B,T,V]
+                    val_loss = criterion(
+                        logits_tf.reshape(-1, logits_tf.size(-1)), target_y.reshape(-1)
+                    )
                 total_val_loss += float(val_loss.item())
 
                 # гриди-декод для метрик
-                logits = model(imgs, is_train=False, batch_max_length=max_len)  # [B, T, V]
+                logits = model(
+                    imgs, is_train=False, batch_max_length=max_len
+                )  # [B, T, V]
                 pred_ids = logits.argmax(-1).cpu()  # [B, T]
-                tgt_ids  = target_y.cpu()           # [B, T]
+                tgt_ids = target_y.cpu()  # [B, T]
 
                 for p_row, t_row in zip(pred_ids, tgt_ids):
-                    hyp = decode_tokens(p_row, itos, pad_id=PAD, eos_id=EOS, blank_id=BLANK)
-                    ref = decode_tokens(t_row, itos, pad_id=PAD, eos_id=EOS, blank_id=BLANK)
+                    hyp = decode_tokens(
+                        p_row, itos, pad_id=PAD, eos_id=EOS, blank_id=BLANK
+                    )
+                    ref = decode_tokens(
+                        t_row, itos, pad_id=PAD, eos_id=EOS, blank_id=BLANK
+                    )
                     hyps.append(hyp)
                     refs.append(ref)
 
         avg_val_loss = total_val_loss / max(1, len(val_loader))
         val_acc = compute_accuracy(refs, hyps)
         # CER/WER
-        val_cer = sum(character_error_rate(r, h) for r, h in zip(refs, hyps)) / max(1, len(refs))
-        val_wer = sum(word_error_rate(r, h) for r, h in zip(refs, hyps)) / max(1, len(refs))
+        val_cer = sum(character_error_rate(r, h) for r, h in zip(refs, hyps)) / max(
+            1, len(refs)
+        )
+        val_wer = sum(word_error_rate(r, h) for r, h in zip(refs, hyps)) / max(
+            1, len(refs)
+        )
 
         writer.add_scalar("Loss/train_epoch", avg_train_loss, epoch)
         writer.add_scalar("Loss/val_epoch", avg_val_loss, epoch)
@@ -318,16 +376,34 @@ def run_training(
         # save "last"
         if (epoch % save_every) == 0:
             save_checkpoint(
-                last_path, model, optimizer, scheduler, scaler, epoch, global_step,
-                avg_val_loss, val_acc, itos, stoi,
+                last_path,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch,
+                global_step,
+                avg_val_loss,
+                val_acc,
+                itos,
+                stoi,
                 {
-                    "batch_size": batch_size, "epochs": epochs, "lr": lr,
-                    "optimizer": optimizer_name, "scheduler": scheduler_name,
-                    "weight_decay": weight_decay, "momentum": momentum,
-                    "img_h": img_h, "img_w": img_w, "encoding": encoding,
-                    "max_len": max_len, "charset_path": charset_path,
-                    "train_csvs": train_csvs, "train_roots": train_roots,
-                    "val_csvs": val_csvs, "val_roots": val_roots,
+                    "batch_size": batch_size,
+                    "epochs": epochs,
+                    "lr": lr,
+                    "optimizer": optimizer_name,
+                    "scheduler": scheduler_name,
+                    "weight_decay": weight_decay,
+                    "momentum": momentum,
+                    "img_h": img_h,
+                    "img_w": img_w,
+                    "encoding": encoding,
+                    "max_len": max_len,
+                    "charset_path": charset_path,
+                    "train_csvs": train_csvs,
+                    "train_roots": train_roots,
+                    "val_csvs": val_csvs,
+                    "val_roots": val_roots,
                 },
                 log_dir,
             )
@@ -337,16 +413,34 @@ def run_training(
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             save_checkpoint(
-                best_loss_path, model, optimizer, scheduler, scaler, epoch, global_step,
-                best_val_loss, val_acc, itos, stoi,
+                best_loss_path,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch,
+                global_step,
+                best_val_loss,
+                val_acc,
+                itos,
+                stoi,
                 {
-                    "batch_size": batch_size, "epochs": epochs, "lr": lr,
-                    "optimizer": optimizer_name, "scheduler": scheduler_name,
-                    "weight_decay": weight_decay, "momentum": momentum,
-                    "img_h": img_h, "img_w": img_w, "encoding": encoding,
-                    "max_len": max_len, "charset_path": charset_path,
-                    "train_csvs": train_csvs, "train_roots": train_roots,
-                    "val_csvs": val_csvs, "val_roots": val_roots,
+                    "batch_size": batch_size,
+                    "epochs": epochs,
+                    "lr": lr,
+                    "optimizer": optimizer_name,
+                    "scheduler": scheduler_name,
+                    "weight_decay": weight_decay,
+                    "momentum": momentum,
+                    "img_h": img_h,
+                    "img_w": img_w,
+                    "encoding": encoding,
+                    "max_len": max_len,
+                    "charset_path": charset_path,
+                    "train_csvs": train_csvs,
+                    "train_roots": train_roots,
+                    "val_csvs": val_csvs,
+                    "val_roots": val_roots,
                 },
                 log_dir,
             )
@@ -355,16 +449,34 @@ def run_training(
         if val_acc >= best_val_acc:
             best_val_acc = val_acc
             save_checkpoint(
-                best_acc_path, model, optimizer, scheduler, scaler, epoch, global_step,
-                best_val_loss, best_val_acc, itos, stoi,
+                best_acc_path,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch,
+                global_step,
+                best_val_loss,
+                best_val_acc,
+                itos,
+                stoi,
                 {
-                    "batch_size": batch_size, "epochs": epochs, "lr": lr,
-                    "optimizer": optimizer_name, "scheduler": scheduler_name,
-                    "weight_decay": weight_decay, "momentum": momentum,
-                    "img_h": img_h, "img_w": img_w, "encoding": encoding,
-                    "max_len": max_len, "charset_path": charset_path,
-                    "train_csvs": train_csvs, "train_roots": train_roots,
-                    "val_csvs": val_csvs, "val_roots": val_roots,
+                    "batch_size": batch_size,
+                    "epochs": epochs,
+                    "lr": lr,
+                    "optimizer": optimizer_name,
+                    "scheduler": scheduler_name,
+                    "weight_decay": weight_decay,
+                    "momentum": momentum,
+                    "img_h": img_h,
+                    "img_w": img_w,
+                    "encoding": encoding,
+                    "max_len": max_len,
+                    "charset_path": charset_path,
+                    "train_csvs": train_csvs,
+                    "train_roots": train_roots,
+                    "val_csvs": val_csvs,
+                    "val_roots": val_roots,
                 },
                 log_dir,
             )

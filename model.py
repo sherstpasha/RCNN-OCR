@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from resnet31 import ResNet31
+from seresnet31 import SEResNet31
 
 
 class BidirectionalLSTM(nn.Module):
@@ -23,12 +24,13 @@ class AttentionCell(nn.Module):
     def __init__(self, input_size, hidden_size, num_embeddings):
         super().__init__()
         self.i2h = nn.Linear(input_size, hidden_size, bias=False)
-        self.h2h = nn.Linear(hidden_size, hidden_size)
+        self.h2h = nn.Linear(hidden_size, hidden_size)  # одно из них с bias
         self.score = nn.Linear(hidden_size, 1, bias=False)
         self.rnn = nn.LSTMCell(input_size + num_embeddings, hidden_size)
         self.hidden_size = hidden_size
 
     def forward(self, prev_hidden, batch_H, char_onehots):
+        # batch_H: [B, Tenc, C]
         proj_H = self.i2h(batch_H)  # [B, Tenc, H]
         proj_h = self.h2h(prev_hidden[0]).unsqueeze(1)
         e = self.score(torch.tanh(proj_H + proj_h))  # [B, Tenc, 1]
@@ -36,7 +38,7 @@ class AttentionCell(nn.Module):
         alpha = F.softmax(e, dim=1)  # [B, Tenc, 1]
         context = torch.bmm(alpha.transpose(1, 2), batch_H).squeeze(1)  # [B, C]
         x = torch.cat([context, char_onehots], 1)  # [B, C + V]
-        cur_hidden = self.rnn(x, prev_hidden)
+        cur_hidden = self.rnn(x, prev_hidden)  # (h, c)
         return cur_hidden, alpha
 
 
@@ -92,7 +94,7 @@ class Attention(nn.Module):
         for t in range(steps):
             onehots = self._char_to_onehot(targets, device=device)
             hidden, _ = self.attention_cell(hidden, batch_H, onehots)
-            logits_t = self.generator(hidden[0])
+            logits_t = self.generator(hidden[0])  # [B, V]
             logits_t = self._mask_logits(logits_t)
             probs[:, t, :] = logits_t
             targets = logits_t.argmax(1)
@@ -125,20 +127,19 @@ class Attention(nn.Module):
         return logits
 
 
-# Learnable positional encoding
-class LearnablePositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
+class BidirectionalLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
         super().__init__()
-        self.pos_embedding = nn.Embedding(max_len, d_model)
+        self.rnn = nn.LSTM(
+            input_size, hidden_size, bidirectional=True, batch_first=True
+        )
+        self.linear = nn.Linear(hidden_size * 2, output_size)
 
     def forward(self, x):
-        """
-        x: [S, B, C]
-        """
-        S, B, C = x.size()
-        positions = torch.arange(0, S, device=x.device).unsqueeze(1).expand(S, B)
-        pos_enc = self.pos_embedding(positions)  # [S, B, C]
-        return x + pos_enc
+        self.rnn.flatten_parameters()
+        h, _ = self.rnn(x)  # [B, T, 2H]
+        out = self.linear(h)  # [B, T, D]
+        return out
 
 
 class RCNN(nn.Module):
@@ -151,39 +152,22 @@ class RCNN(nn.Module):
         pad_id: int = 0,
         blank_id: int | None = 3,
         enc_dropout_p: float = 0.1,
-        nhead: int = 8,
-        num_layers: int = 3,
-        dim_feedforward: int = 2048,
-        max_len: int = 5000,
     ):
         super().__init__()
 
         self.num_classes = num_classes
         self.hidden_size = hidden_size
 
-        # CNN backbone
-        self.cnn = ResNet31(in_channels=3, out_channels=512)
+        # self.cnn = ResNet31(in_channels=3, out_channels=512)
+        self.cnn = SEResNet31(in_channels=3, out_channels=512)
         self.pool = nn.AdaptiveAvgPool2d((1, None))  # -> [B, C, 1, W]
 
         enc_dim = self.cnn.out_channels
-
-        # Learnable positional encoding
-        self.pos_encoder = LearnablePositionalEncoding(enc_dim, max_len=max_len)
-
-        # Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=enc_dim,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=enc_dropout_p,
-            batch_first=False,
-            activation="relu",
-        )
-        self.enc_rnn = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.enc_rnn = BidirectionalLSTM(enc_dim, hidden_size, hidden_size)
+        enc_dim = hidden_size
 
         self.enc_dropout = nn.Dropout(enc_dropout_p)
 
-        # Attention decoder
         self.attn = Attention(
             input_size=enc_dim,
             hidden_size=hidden_size,
@@ -198,13 +182,7 @@ class RCNN(nn.Module):
         f = self.cnn(x)  # [B, C, H, W]
         f = self.pool(f).squeeze(2)  # [B, C, W]
         f = f.permute(0, 2, 1)  # [B, W, C]
-
-        # [S, B, C]
-        f = f.permute(1, 0, 2)  # [W, B, C]
-        f = self.pos_encoder(f)
-        f = self.enc_rnn(f)  # [W, B, C]
-        f = f.permute(1, 0, 2)  # [B, W, C]
-
+        f = self.enc_rnn(f)  # [B, W, H]
         f = self.enc_dropout(f)
         return f
 
