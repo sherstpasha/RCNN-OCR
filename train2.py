@@ -99,6 +99,8 @@ def save_checkpoint(
     }
     torch.save(ckpt, path)
 
+def save_weights(path, model):
+    torch.save(model.state_dict(), path)
 
 def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None, map_location="auto"):
     if map_location == "auto":
@@ -169,6 +171,9 @@ def run_training(
     best_loss_path = os.path.join(exp_dir, "best_loss_ckpt.pth")
     best_acc_path = os.path.join(exp_dir, "best_acc_ckpt.pth")
     last_path = os.path.join(exp_dir, "last_ckpt.pth")
+    best_loss_weights_path = os.path.join(exp_dir, "best_loss_weights.pth")
+    best_acc_weights_path  = os.path.join(exp_dir, "best_acc_weights.pth")
+    last_weights_path      = os.path.join(exp_dir, "last_weights.pth")
 
     # --- charset ---
     itos, stoi = load_charset(charset_path)
@@ -326,6 +331,7 @@ def run_training(
                 },
                 log_dir,
             )
+            save_weights(last_weights_path, model)
 
         # track bests
         if avg_val_loss < best_val_loss:
@@ -344,6 +350,7 @@ def run_training(
                 },
                 log_dir,
             )
+            save_weights(best_loss_weights_path, model)
 
         if val_acc >= best_val_acc:
             best_val_acc = val_acc
@@ -361,6 +368,7 @@ def run_training(
                 },
                 log_dir,
             )
+            save_weights(best_acc_weights_path, model)
 
         # scheduler step
         if scheduler is not None:
