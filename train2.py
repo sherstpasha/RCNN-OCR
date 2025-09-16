@@ -377,11 +377,9 @@ def run_training(
                     val_loss = val_loss_attn + 0.3 * val_loss_ctc
                 total_val_loss += float(val_loss.item())
 
-                # гриди-декод для метрик
-                logits = model(
-                    imgs, is_train=False, batch_max_length=max_len
-                )  # [B, T, V]
-                pred_ids = logits.argmax(-1).cpu()  # [B, T]
+                # гриди-декод для метрик — используем только attention
+                attn_logits, _ = model(imgs, is_train=False, batch_max_length=max_len)
+                pred_ids = attn_logits.argmax(-1).cpu()  # [B, T]
                 tgt_ids = target_y.cpu()  # [B, T]
 
                 for p_row, t_row in zip(pred_ids, tgt_ids):
