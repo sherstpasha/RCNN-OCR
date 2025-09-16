@@ -1,4 +1,5 @@
 import torch.nn as nn
+from torchvision.ops import DropBlock2d
 
 
 class SELayer(nn.Module):
@@ -22,7 +23,16 @@ class SELayer(nn.Module):
 class SEBasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None, reduction=16):
+    def __init__(
+        self,
+        inplanes,
+        planes,
+        stride=1,
+        downsample=None,
+        reduction=16,
+        dropblock_p=0.0,
+        dropblock_block_size=5,
+    ):
         super().__init__()
         self.conv1 = nn.Conv2d(
             inplanes, planes, kernel_size=3, stride=stride, padding=1, bias=False
@@ -36,11 +46,22 @@ class SEBasicBlock(nn.Module):
         self.se = SELayer(planes, reduction)
         self.downsample = downsample
 
+        # DropBlock (активируется если dropblock_p > 0)
+        self.dropblock = (
+            DropBlock2d(p=dropblock_p, block_size=dropblock_block_size)
+            if dropblock_p > 0
+            else nn.Identity()
+        )
+
     def forward(self, x):
         identity = x
+
         out = self.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
-        out = self.se(out)  # 🔹 усилили каналы
+
+        out = self.se(out)
+        out = self.dropblock(out)  # 🔹 DropBlock внутри residual
+
         if self.downsample is not None:
             identity = self.downsample(x)
         out = self.relu(out + identity)
@@ -48,7 +69,14 @@ class SEBasicBlock(nn.Module):
 
 
 class SEResNet31(nn.Module):
-    def __init__(self, in_channels=3, out_channels=512, reduction=16):
+    def __init__(
+        self,
+        in_channels=3,
+        out_channels=512,
+        reduction=16,
+        dropblock_p=0.1,
+        dropblock_block_size=5,
+    ):
         super().__init__()
         # stem
         self.conv0 = nn.Sequential(
@@ -63,17 +91,41 @@ class SEResNet31(nn.Module):
 
         # residual stages
         self.layer1 = self._make_layer(
-            128, 256, blocks=1, stride=2, reduction=reduction
-        )  # H/4, W/4
+            128,
+            256,
+            blocks=1,
+            stride=2,
+            reduction=reduction,
+            dropblock_p=dropblock_p,
+            dropblock_block_size=dropblock_block_size,
+        )
         self.layer2 = self._make_layer(
-            256, 256, blocks=2, stride=1, reduction=reduction
-        )  # H/4, W/4
+            256,
+            256,
+            blocks=2,
+            stride=1,
+            reduction=reduction,
+            dropblock_p=dropblock_p,
+            dropblock_block_size=dropblock_block_size,
+        )
         self.layer3 = self._make_layer(
-            256, 512, blocks=5, stride=2, reduction=reduction
-        )  # H/8, W/8
+            256,
+            512,
+            blocks=5,
+            stride=2,
+            reduction=reduction,
+            dropblock_p=dropblock_p,
+            dropblock_block_size=dropblock_block_size,
+        )
         self.layer4 = self._make_layer(
-            512, 512, blocks=3, stride=1, reduction=reduction
-        )  # H/8, W/8
+            512,
+            512,
+            blocks=3,
+            stride=1,
+            reduction=reduction,
+            dropblock_p=dropblock_p,
+            dropblock_block_size=dropblock_block_size,
+        )
 
         self.conv_out = nn.Sequential(
             nn.Conv2d(512, out_channels, 2, stride=(2, 1), padding=(0, 1), bias=False),
@@ -86,7 +138,16 @@ class SEResNet31(nn.Module):
 
         self.out_channels = out_channels
 
-    def _make_layer(self, inplanes, planes, blocks, stride=1, reduction=16):
+    def _make_layer(
+        self,
+        inplanes,
+        planes,
+        blocks,
+        stride=1,
+        reduction=16,
+        dropblock_p=0.0,
+        dropblock_block_size=5,
+    ):
         downsample = None
         if stride != 1 or inplanes != planes:
             downsample = nn.Sequential(
@@ -94,9 +155,27 @@ class SEResNet31(nn.Module):
                 nn.BatchNorm2d(planes),
             )
 
-        layers = [SEBasicBlock(inplanes, planes, stride, downsample, reduction)]
+        layers = [
+            SEBasicBlock(
+                inplanes,
+                planes,
+                stride,
+                downsample,
+                reduction,
+                dropblock_p=dropblock_p,
+                dropblock_block_size=dropblock_block_size,
+            )
+        ]
         for _ in range(1, blocks):
-            layers.append(SEBasicBlock(planes, planes, reduction=reduction))
+            layers.append(
+                SEBasicBlock(
+                    planes,
+                    planes,
+                    reduction=reduction,
+                    dropblock_p=dropblock_p,
+                    dropblock_block_size=dropblock_block_size,
+                )
+            )
         return nn.Sequential(*layers)
 
     def forward(self, x):

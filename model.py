@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from resnet31 import ResNet31
 from seresnet31 import SEResNet31
 
 
@@ -24,7 +23,7 @@ class AttentionCell(nn.Module):
     def __init__(self, input_size, hidden_size, num_embeddings, dropout_p=0.1):
         super().__init__()
         self.i2h = nn.Linear(input_size, hidden_size, bias=False)
-        self.h2h = nn.Linear(hidden_size, hidden_size)  # одно из них с bias
+        self.h2h = nn.Linear(hidden_size, hidden_size)
         self.score = nn.Linear(hidden_size, 1, bias=False)
         self.rnn = nn.LSTMCell(input_size + num_embeddings, hidden_size)
         self.hidden_size = hidden_size
@@ -56,7 +55,7 @@ class Attention(nn.Module):
         pad_id: int,
         blank_id: int | None = None,
         dropout_p: float = 0.1,
-        sampling_prob: float = 0.1,
+        sampling_prob: float = 0.0,
     ):
         super().__init__()
         self.attention_cell = AttentionCell(
@@ -134,11 +133,9 @@ class Attention(nn.Module):
             hidden, _ = self.attention_cell(hidden, batch_H, onehots)
             out_hid[:, t, :] = hidden[0]
 
-            # dropout перед генератором
             out = F.dropout(hidden[0], p=self.dropout_p, training=self.training)
             logits_t = self.generator(out)
 
-            # scheduled sampling
             if t < steps - 1:
                 if is_train and torch.rand(1).item() < self.sampling_prob:
                     targets = logits_t.argmax(1)
@@ -175,19 +172,29 @@ class RCNN(nn.Module):
         pad_id: int = 0,
         blank_id: int | None = 3,
         enc_dropout_p: float = 0.1,
+        dropblock_p: float = 0.1,
+        dropblock_block_size: int = 5,
     ):
         super().__init__()
 
         self.num_classes = num_classes
         self.hidden_size = hidden_size
 
-        # self.cnn = ResNet31(in_channels=3, out_channels=512)
-        self.cnn = SEResNet31(in_channels=3, out_channels=512)
+        self.cnn = SEResNet31(
+            in_channels=3,
+            out_channels=512,
+            dropblock_p=dropblock_p,
+            dropblock_block_size=dropblock_block_size,
+        )
 
         self.pool = nn.AdaptiveAvgPool2d((1, None))  # -> [B, C, 1, W]
 
         enc_dim = self.cnn.out_channels
-        self.enc_rnn = BidirectionalLSTM(enc_dim, hidden_size, hidden_size)
+        # Две BiLSTM подряд (классическая схема для OCR)
+        self.enc_rnn = nn.Sequential(
+            BidirectionalLSTM(enc_dim, hidden_size, hidden_size),
+            BidirectionalLSTM(hidden_size, hidden_size, hidden_size),
+        )
         enc_dim = hidden_size
 
         self.enc_dropout = nn.Dropout(enc_dropout_p)
@@ -200,6 +207,8 @@ class RCNN(nn.Module):
             eos_id=eos_id,
             pad_id=pad_id,
             blank_id=blank_id,
+            dropout_p=0.1,
+            sampling_prob=0.0,  # scheduled sampling OFF по умолчанию
         )
 
     def encode(self, x):
