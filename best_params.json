@@ -1,6 +1,6 @@
 {
     "lr": 0.000510753964866869,
-    "batch_size": 32,
+    "batch_size": 64,
     "optimizer": "Adam",
     "scheduler": "CosineAnnealingLR",
     "weight_decay": 1.9547932698947658e-05,

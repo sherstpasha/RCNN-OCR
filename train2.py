@@ -198,10 +198,7 @@ def run_training(
         blank_id=BLANK,
     ).to(device)
 
-    attn_loss_fn = nn.CrossEntropyLoss(ignore_index=PAD)
-    ctc_loss_fn = nn.CTCLoss(
-        blank=BLANK if BLANK is not None else PAD, zero_infinity=True
-    )
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD, label_smoothing=0.1)
 
     # optimizer
     if optimizer_name == "Adam":
@@ -306,29 +303,12 @@ def run_training(
 
             optimizer.zero_grad(set_to_none=True)
             with amp.autocast():
-                attn_logits, ctc_logits = model(
+                logits = model(
                     imgs, text=text_in, is_train=True, batch_max_length=max_len
+                )  # [B, T, V]
+                loss = criterion(
+                    logits.reshape(-1, logits.size(-1)), target_y.reshape(-1)
                 )
-
-                # attention loss
-                loss_attn = attn_loss_fn(
-                    attn_logits.reshape(-1, attn_logits.size(-1)), target_y.reshape(-1)
-                )
-
-                # ctc loss
-                input_lengths = torch.full(
-                    size=(ctc_logits.size(1),),
-                    fill_value=ctc_logits.size(0),
-                    dtype=torch.long,
-                    device=device,
-                )
-                target_lengths = lengths.to(device)
-                loss_ctc = ctc_loss_fn(
-                    ctc_logits.log_softmax(2), target_y, input_lengths, target_lengths
-                )
-
-                # итог
-                loss = loss_attn + 0.3 * loss_ctc
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -351,35 +331,20 @@ def run_training(
                 target_y = target_y.to(device)
 
                 with amp.autocast():
-                    attn_logits, ctc_logits = model(
+                    # лосс на teacher forcing
+                    logits_tf = model(
                         imgs, text=text_in, is_train=True, batch_max_length=max_len
+                    )  # [B,T,V]
+                    val_loss = criterion(
+                        logits_tf.reshape(-1, logits_tf.size(-1)), target_y.reshape(-1)
                     )
-
-                    val_loss_attn = attn_loss_fn(
-                        attn_logits.reshape(-1, attn_logits.size(-1)),
-                        target_y.reshape(-1),
-                    )
-
-                    input_lengths = torch.full(
-                        size=(ctc_logits.size(1),),
-                        fill_value=ctc_logits.size(0),
-                        dtype=torch.long,
-                        device=device,
-                    )
-                    target_lengths = lengths.to(device)
-                    val_loss_ctc = ctc_loss_fn(
-                        ctc_logits.log_softmax(2),
-                        target_y,
-                        input_lengths,
-                        target_lengths,
-                    )
-
-                    val_loss = val_loss_attn + 0.3 * val_loss_ctc
                 total_val_loss += float(val_loss.item())
 
-                # гриди-декод для метрик — используем только attention
-                attn_logits, _ = model(imgs, is_train=False, batch_max_length=max_len)
-                pred_ids = attn_logits.argmax(-1).cpu()  # [B, T]
+                # гриди-декод для метрик
+                logits = model(
+                    imgs, is_train=False, batch_max_length=max_len
+                )  # [B, T, V]
+                pred_ids = logits.argmax(-1).cpu()  # [B, T]
                 tgt_ids = target_y.cpu()  # [B, T]
 
                 for p_row, t_row in zip(pred_ids, tgt_ids):
