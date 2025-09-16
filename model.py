@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from resnet31 import ResNet31
 from seresnet31 import SEResNet31
 
+
 class BidirectionalLSTM(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
         super().__init__()
@@ -20,13 +21,14 @@ class BidirectionalLSTM(nn.Module):
 
 
 class AttentionCell(nn.Module):
-    def __init__(self, input_size, hidden_size, num_embeddings):
+    def __init__(self, input_size, hidden_size, num_embeddings, dropout_p=0.1):
         super().__init__()
         self.i2h = nn.Linear(input_size, hidden_size, bias=False)
         self.h2h = nn.Linear(hidden_size, hidden_size)  # одно из них с bias
         self.score = nn.Linear(hidden_size, 1, bias=False)
         self.rnn = nn.LSTMCell(input_size + num_embeddings, hidden_size)
         self.hidden_size = hidden_size
+        self.dropout_p = dropout_p
 
     def forward(self, prev_hidden, batch_H, char_onehots):
         # batch_H: [B, Tenc, C]
@@ -35,6 +37,8 @@ class AttentionCell(nn.Module):
         e = self.score(torch.tanh(proj_H + proj_h))  # [B, Tenc, 1]
 
         alpha = F.softmax(e, dim=1)  # [B, Tenc, 1]
+        alpha = F.dropout(alpha, p=self.dropout_p, training=self.training)
+
         context = torch.bmm(alpha.transpose(1, 2), batch_H).squeeze(1)  # [B, C]
         x = torch.cat([context, char_onehots], 1)  # [B, C + V]
         cur_hidden = self.rnn(x, prev_hidden)  # (h, c)
@@ -51,9 +55,13 @@ class Attention(nn.Module):
         eos_id: int,
         pad_id: int,
         blank_id: int | None = None,
+        dropout_p: float = 0.1,
+        sampling_prob: float = 0.1,
     ):
         super().__init__()
-        self.attention_cell = AttentionCell(input_size, hidden_size, num_classes)
+        self.attention_cell = AttentionCell(
+            input_size, hidden_size, num_classes, dropout_p=dropout_p
+        )
         self.hidden_size = hidden_size
         self.num_classes = num_classes
 
@@ -63,6 +71,8 @@ class Attention(nn.Module):
         self.blank_id = blank_id
 
         self.generator = nn.Linear(hidden_size, num_classes)
+        self.dropout_p = dropout_p
+        self.sampling_prob = sampling_prob
 
     def _char_to_onehot(self, input_char, device):
         B = input_char.size(0)
@@ -93,7 +103,8 @@ class Attention(nn.Module):
         for t in range(steps):
             onehots = self._char_to_onehot(targets, device=device)
             hidden, _ = self.attention_cell(hidden, batch_H, onehots)
-            logits_t = self.generator(hidden[0])  # [B, V]
+            out = F.dropout(hidden[0], p=self.dropout_p, training=self.training)
+            logits_t = self.generator(out)  # [B, V]
             logits_t = self._mask_logits(logits_t)
             probs[:, t, :] = logits_t
             targets = logits_t.argmax(1)
@@ -116,10 +127,23 @@ class Attention(nn.Module):
         hidden = (h, c)
 
         out_hid = torch.zeros(B, steps, self.hidden_size, device=device)
+        targets = text[:, 0]  # <SOS>
+
         for t in range(steps):
-            onehots = self._char_to_onehot(text[:, t], device=device)
+            onehots = self._char_to_onehot(targets, device=device)
             hidden, _ = self.attention_cell(hidden, batch_H, onehots)
             out_hid[:, t, :] = hidden[0]
+
+            # dropout перед генератором
+            out = F.dropout(hidden[0], p=self.dropout_p, training=self.training)
+            logits_t = self.generator(out)
+
+            # scheduled sampling
+            if t < steps - 1:
+                if is_train and torch.rand(1).item() < self.sampling_prob:
+                    targets = logits_t.argmax(1)
+                else:
+                    targets = text[:, t + 1]
 
         logits = self.generator(out_hid)
         logits = self._mask_logits(logits)
