@@ -24,13 +24,12 @@ class AttentionCell(nn.Module):
     def __init__(self, input_size, hidden_size, num_embeddings):
         super().__init__()
         self.i2h = nn.Linear(input_size, hidden_size, bias=False)
-        self.h2h = nn.Linear(hidden_size, hidden_size)  # одно из них с bias
+        self.h2h = nn.Linear(hidden_size, hidden_size)
         self.score = nn.Linear(hidden_size, 1, bias=False)
         self.rnn = nn.LSTMCell(input_size + num_embeddings, hidden_size)
         self.hidden_size = hidden_size
 
     def forward(self, prev_hidden, batch_H, char_onehots):
-        # batch_H: [B, Tenc, C]
         proj_H = self.i2h(batch_H)  # [B, Tenc, H]
         proj_h = self.h2h(prev_hidden[0]).unsqueeze(1)
         e = self.score(torch.tanh(proj_H + proj_h))  # [B, Tenc, 1]
@@ -158,7 +157,6 @@ class RCNN(nn.Module):
         self.num_classes = num_classes
         self.hidden_size = hidden_size
 
-        # self.cnn = ResNet31(in_channels=3, out_channels=512)
         self.cnn = SEResNet31(in_channels=3, out_channels=512)
         self.pool = nn.AdaptiveAvgPool2d((1, None))  # -> [B, C, 1, W]
 
@@ -167,6 +165,8 @@ class RCNN(nn.Module):
         enc_dim = hidden_size
 
         self.enc_dropout = nn.Dropout(enc_dropout_p)
+
+        self.ctc_head = nn.Linear(enc_dim, num_classes)
 
         self.attn = Attention(
             input_size=enc_dim,
@@ -188,6 +188,12 @@ class RCNN(nn.Module):
 
     def forward(self, x, text=None, is_train=True, batch_max_length=25):
         enc = self.encode(x)
-        return self.attn(
+
+        ctc_logits = self.ctc_head(enc)  # [B, W, V]
+        ctc_logits = ctc_logits.permute(1, 0, 2)  # [W, B, V]
+
+        attn_logits = self.attn(
             enc, text=text, is_train=is_train, batch_max_length=batch_max_length
         )
+
+        return attn_logits, ctc_logits

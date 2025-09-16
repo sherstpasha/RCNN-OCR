@@ -198,7 +198,10 @@ def run_training(
         blank_id=BLANK,
     ).to(device)
 
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD)
+    attn_loss_fn = nn.CrossEntropyLoss(ignore_index=PAD)
+    ctc_loss_fn = nn.CTCLoss(
+        blank=BLANK if BLANK is not None else PAD, zero_infinity=True
+    )
 
     # optimizer
     if optimizer_name == "Adam":
@@ -303,12 +306,29 @@ def run_training(
 
             optimizer.zero_grad(set_to_none=True)
             with amp.autocast():
-                logits = model(
+                attn_logits, ctc_logits = model(
                     imgs, text=text_in, is_train=True, batch_max_length=max_len
-                )  # [B, T, V]
-                loss = criterion(
-                    logits.reshape(-1, logits.size(-1)), target_y.reshape(-1)
                 )
+
+                # attention loss
+                loss_attn = attn_loss_fn(
+                    attn_logits.reshape(-1, attn_logits.size(-1)), target_y.reshape(-1)
+                )
+
+                # ctc loss
+                input_lengths = torch.full(
+                    size=(ctc_logits.size(1),),
+                    fill_value=ctc_logits.size(0),
+                    dtype=torch.long,
+                    device=device,
+                )
+                target_lengths = lengths.to(device)
+                loss_ctc = ctc_loss_fn(
+                    ctc_logits.log_softmax(2), target_y, input_lengths, target_lengths
+                )
+
+                # итог
+                loss = loss_attn + 0.3 * loss_ctc
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -331,13 +351,30 @@ def run_training(
                 target_y = target_y.to(device)
 
                 with amp.autocast():
-                    # лосс на teacher forcing
-                    logits_tf = model(
+                    attn_logits, ctc_logits = model(
                         imgs, text=text_in, is_train=True, batch_max_length=max_len
-                    )  # [B,T,V]
-                    val_loss = criterion(
-                        logits_tf.reshape(-1, logits_tf.size(-1)), target_y.reshape(-1)
                     )
+
+                    val_loss_attn = attn_loss_fn(
+                        attn_logits.reshape(-1, attn_logits.size(-1)),
+                        target_y.reshape(-1),
+                    )
+
+                    input_lengths = torch.full(
+                        size=(ctc_logits.size(1),),
+                        fill_value=ctc_logits.size(0),
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    target_lengths = lengths.to(device)
+                    val_loss_ctc = ctc_loss_fn(
+                        ctc_logits.log_softmax(2),
+                        target_y,
+                        input_lengths,
+                        target_lengths,
+                    )
+
+                    val_loss = val_loss_attn + 0.3 * val_loss_ctc
                 total_val_loss += float(val_loss.item())
 
                 # гриди-декод для метрик
