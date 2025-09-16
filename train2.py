@@ -198,7 +198,7 @@ def run_training(
         blank_id=BLANK,
     ).to(device)
 
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD, label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD)
 
     # optimizer
     if optimizer_name == "Adam":
