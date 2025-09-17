@@ -507,7 +507,7 @@ if __name__ == "__main__":
         img_w=IMG_W,
         device="cuda",
         encoding="utf-8",
-        max_len=25,
+        max_len=50,
     )
 
     default_params = {
