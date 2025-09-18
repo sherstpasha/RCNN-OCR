@@ -19,6 +19,49 @@ class BidirectionalLSTM(nn.Module):
         return out
 
 
+class LocationAwareAttentionCell(nn.Module):
+    def __init__(
+        self, input_size, hidden_size, num_embeddings, dropout_p=0.1, conv_kernel=11
+    ):
+        super().__init__()
+        self.i2h = nn.Linear(input_size, hidden_size, bias=False)
+        self.h2h = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.f2h = nn.Conv1d(
+            in_channels=1,
+            out_channels=hidden_size,
+            kernel_size=conv_kernel,
+            padding=conv_kernel // 2,
+            bias=False,
+        )
+        self.score = nn.Linear(hidden_size, 1, bias=False)
+
+        self.rnn = nn.LSTMCell(input_size + num_embeddings, hidden_size)
+        self.hidden_size = hidden_size
+        self.dropout_p = dropout_p
+
+    def forward(self, prev_hidden, batch_H, char_onehots, prev_alpha=None):
+        B, Tenc, _ = batch_H.size()
+
+        proj_H = self.i2h(batch_H)  # [B, Tenc, H]
+        proj_h = self.h2h(prev_hidden[0]).unsqueeze(1)  # [B, 1, H]
+
+        if prev_alpha is None:
+            prev_alpha = batch_H.new_zeros(B, Tenc, 1)
+
+        f = self.f2h(prev_alpha.transpose(1, 2))  # [B, H, Tenc]
+        f = f.transpose(1, 2)  # [B, Tenc, H]
+
+        e = self.score(torch.tanh(proj_H + proj_h + f))  # [B, Tenc, 1]
+        alpha = F.softmax(e, dim=1)  # [B, Tenc, 1]
+        alpha = F.dropout(alpha, p=self.dropout_p, training=self.training)
+
+        context = torch.bmm(alpha.transpose(1, 2), batch_H).squeeze(1)  # [B, C]
+        x = torch.cat([context, char_onehots], dim=1)  # [B, C+V]
+
+        cur_hidden = self.rnn(x, prev_hidden)  # (h, c)
+        return cur_hidden, alpha
+
+
 class AttentionCell(nn.Module):
     def __init__(self, input_size, hidden_size, num_embeddings, dropout_p=0.1):
         super().__init__()
@@ -58,8 +101,8 @@ class Attention(nn.Module):
         sampling_prob: float = 0.0,
     ):
         super().__init__()
-        self.attention_cell = AttentionCell(
-            input_size, hidden_size, num_classes, dropout_p=dropout_p
+        self.attention_cell = LocationAwareAttentionCell(
+            input_size, hidden_size, num_classes, dropout_p=dropout_p, conv_kernel=11
         )
         self.hidden_size = hidden_size
         self.num_classes = num_classes
@@ -99,9 +142,12 @@ class Attention(nn.Module):
         targets = torch.full((B,), self.sos_id, dtype=torch.long, device=device)
         probs = torch.zeros(B, steps, self.num_classes, device=device)
 
+        prev_alpha = None
         for t in range(steps):
             onehots = self._char_to_onehot(targets, device=device)
-            hidden, _ = self.attention_cell(hidden, batch_H, onehots)
+            hidden, prev_alpha = self.attention_cell(
+                hidden, batch_H, onehots, prev_alpha
+            )
             out = F.dropout(hidden[0], p=self.dropout_p, training=self.training)
             logits_t = self.generator(out)  # [B, V]
             logits_t = self._mask_logits(logits_t)
@@ -127,10 +173,13 @@ class Attention(nn.Module):
 
         out_hid = torch.zeros(B, steps, self.hidden_size, device=device)
         targets = text[:, 0]  # <SOS>
+        prev_alpha = None
 
         for t in range(steps):
             onehots = self._char_to_onehot(targets, device=device)
-            hidden, _ = self.attention_cell(hidden, batch_H, onehots)
+            hidden, prev_alpha = self.attention_cell(
+                hidden, batch_H, onehots, prev_alpha
+            )
             out_hid[:, t, :] = hidden[0]
 
             out = F.dropout(hidden[0], p=self.dropout_p, training=self.training)
