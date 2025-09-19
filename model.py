@@ -19,47 +19,21 @@ class BidirectionalLSTM(nn.Module):
         return out
 
 
-class LocationAwareAttentionCell(nn.Module):
-    def __init__(
-        self, input_size, hidden_size, num_embeddings, dropout_p=0.1, conv_kernel=11
-    ):
+class SeqSE(nn.Module):
+    """Squeeze-and-Excitation по каналам для последовательностей [B, T, C]."""
+
+    def __init__(self, channels, reduction=16):
         super().__init__()
-        self.i2h = nn.Linear(input_size, hidden_size, bias=False)
-        self.h2h = nn.Linear(hidden_size, hidden_size, bias=True)
-        self.f2h = nn.Conv1d(
-            in_channels=1,
-            out_channels=hidden_size,
-            kernel_size=conv_kernel,
-            padding=conv_kernel // 2,
-            bias=False,
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels),
+            nn.Sigmoid(),
         )
-        self.score = nn.Linear(hidden_size, 1, bias=False)
 
-        self.rnn = nn.LSTMCell(input_size + num_embeddings, hidden_size)
-        self.hidden_size = hidden_size
-        self.dropout_p = dropout_p
-
-    def forward(self, prev_hidden, batch_H, char_onehots, prev_alpha=None):
-        B, Tenc, _ = batch_H.size()
-
-        proj_H = self.i2h(batch_H)  # [B, Tenc, H]
-        proj_h = self.h2h(prev_hidden[0]).unsqueeze(1)  # [B, 1, H]
-
-        if prev_alpha is None:
-            prev_alpha = batch_H.new_zeros(B, Tenc, 1)
-
-        f = self.f2h(prev_alpha.transpose(1, 2))  # [B, H, Tenc]
-        f = f.transpose(1, 2)  # [B, Tenc, H]
-
-        e = self.score(torch.tanh(proj_H + proj_h + f))  # [B, Tenc, 1]
-        alpha = F.softmax(e, dim=1)  # [B, Tenc, 1]
-        alpha = F.dropout(alpha, p=self.dropout_p, training=self.training)
-
-        context = torch.bmm(alpha.transpose(1, 2), batch_H).squeeze(1)  # [B, C]
-        x = torch.cat([context, char_onehots], dim=1)  # [B, C+V]
-
-        cur_hidden = self.rnn(x, prev_hidden)  # (h, c)
-        return cur_hidden, alpha
+    def forward(self, x):  # x: [B, T, C]
+        w = self.fc(x.mean(1))  # [B, C]
+        return x * w.unsqueeze(1)
 
 
 class AttentionCell(nn.Module):
@@ -73,17 +47,16 @@ class AttentionCell(nn.Module):
         self.dropout_p = dropout_p
 
     def forward(self, prev_hidden, batch_H, char_onehots):
-        # batch_H: [B, Tenc, C]
-        proj_H = self.i2h(batch_H)  # [B, Tenc, H]
+        proj_H = self.i2h(batch_H)
         proj_h = self.h2h(prev_hidden[0]).unsqueeze(1)
-        e = self.score(torch.tanh(proj_H + proj_h))  # [B, Tenc, 1]
+        e = self.score(torch.tanh(proj_H + proj_h))  # [B, T, 1]
 
-        alpha = F.softmax(e, dim=1)  # [B, Tenc, 1]
+        alpha = F.softmax(e, dim=1)
         alpha = F.dropout(alpha, p=self.dropout_p, training=self.training)
 
-        context = torch.bmm(alpha.transpose(1, 2), batch_H).squeeze(1)  # [B, C]
-        x = torch.cat([context, char_onehots], 1)  # [B, C + V]
-        cur_hidden = self.rnn(x, prev_hidden)  # (h, c)
+        context = torch.bmm(alpha.transpose(1, 2), batch_H).squeeze(1)
+        x = torch.cat([context, char_onehots], 1)
+        cur_hidden = self.rnn(x, prev_hidden)
         return cur_hidden, alpha
 
 
@@ -101,8 +74,8 @@ class Attention(nn.Module):
         sampling_prob: float = 0.0,
     ):
         super().__init__()
-        self.attention_cell = LocationAwareAttentionCell(
-            input_size, hidden_size, num_classes, dropout_p=dropout_p, conv_kernel=11
+        self.attention_cell = AttentionCell(
+            input_size, hidden_size, num_classes, dropout_p=dropout_p
         )
         self.hidden_size = hidden_size
         self.num_classes = num_classes
@@ -142,14 +115,11 @@ class Attention(nn.Module):
         targets = torch.full((B,), self.sos_id, dtype=torch.long, device=device)
         probs = torch.zeros(B, steps, self.num_classes, device=device)
 
-        prev_alpha = None
         for t in range(steps):
             onehots = self._char_to_onehot(targets, device=device)
-            hidden, prev_alpha = self.attention_cell(
-                hidden, batch_H, onehots, prev_alpha
-            )
+            hidden, _ = self.attention_cell(hidden, batch_H, onehots)
             out = F.dropout(hidden[0], p=self.dropout_p, training=self.training)
-            logits_t = self.generator(out)  # [B, V]
+            logits_t = self.generator(out)
             logits_t = self._mask_logits(logits_t)
             probs[:, t, :] = logits_t
             targets = logits_t.argmax(1)
@@ -160,9 +130,7 @@ class Attention(nn.Module):
         if not is_train:
             return self._greedy_decode(batch_H, batch_max_length)
 
-        assert (
-            text is not None
-        ), "For training, `text` with <SOS> at text[:,0] is required"
+        assert text is not None
         device = batch_H.device
         B = batch_H.size(0)
         steps = batch_max_length + 1
@@ -172,14 +140,11 @@ class Attention(nn.Module):
         hidden = (h, c)
 
         out_hid = torch.zeros(B, steps, self.hidden_size, device=device)
-        targets = text[:, 0]  # <SOS>
-        prev_alpha = None
+        targets = text[:, 0]
 
         for t in range(steps):
             onehots = self._char_to_onehot(targets, device=device)
-            hidden, prev_alpha = self.attention_cell(
-                hidden, batch_H, onehots, prev_alpha
-            )
+            hidden, _ = self.attention_cell(hidden, batch_H, onehots)
             out_hid[:, t, :] = hidden[0]
 
             out = F.dropout(hidden[0], p=self.dropout_p, training=self.training)
@@ -194,21 +159,6 @@ class Attention(nn.Module):
         logits = self.generator(out_hid)
         logits = self._mask_logits(logits)
         return logits
-
-
-class BidirectionalLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size):
-        super().__init__()
-        self.rnn = nn.LSTM(
-            input_size, hidden_size, bidirectional=True, batch_first=True
-        )
-        self.linear = nn.Linear(hidden_size * 2, output_size)
-
-    def forward(self, x):
-        self.rnn.flatten_parameters()
-        h, _ = self.rnn(x)  # [B, T, 2H]
-        out = self.linear(h)  # [B, T, D]
-        return out
 
 
 class RCNN(nn.Module):
@@ -236,16 +186,16 @@ class RCNN(nn.Module):
             dropblock_block_size=dropblock_block_size,
         )
 
-        self.pool = nn.AdaptiveAvgPool2d((1, None))  # -> [B, C, 1, W]
+        self.pool = nn.AdaptiveAvgPool2d((1, None))
 
         enc_dim = self.cnn.out_channels
-        # Две BiLSTM подряд (классическая схема для OCR)
         self.enc_rnn = nn.Sequential(
             BidirectionalLSTM(enc_dim, hidden_size, hidden_size),
             BidirectionalLSTM(hidden_size, hidden_size, hidden_size),
         )
         enc_dim = hidden_size
 
+        self.seq_se = SeqSE(enc_dim)  # 🔹 новый блок SE для последовательности
         self.enc_dropout = nn.Dropout(enc_dropout_p)
 
         self.attn = Attention(
@@ -257,14 +207,15 @@ class RCNN(nn.Module):
             pad_id=pad_id,
             blank_id=blank_id,
             dropout_p=0.1,
-            sampling_prob=0.0,  # scheduled sampling OFF по умолчанию
+            sampling_prob=0.0,
         )
 
     def encode(self, x):
-        f = self.cnn(x)  # [B, C, H, W]
+        f = self.cnn(x)
         f = self.pool(f).squeeze(2)  # [B, C, W]
         f = f.permute(0, 2, 1)  # [B, W, C]
         f = self.enc_rnn(f)  # [B, W, H]
+        f = self.seq_se(f)  # 🔹 усиливаем признаки
         f = self.enc_dropout(f)
         return f
 
