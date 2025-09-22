@@ -131,7 +131,7 @@ class OCRDatasetAttn(Dataset):
         self,
         csv_path: str,
         images_dir: str,
-        stoi: dict,                        
+        stoi: dict,
         img_height: int = 32,
         img_max_width: int = 128,
         encoding: str = "utf-8",
@@ -144,23 +144,38 @@ class OCRDatasetAttn(Dataset):
         self.transform = transform
 
         self.samples: List[Tuple[str, str]] = []
+        skipped = 0
         with open(csv_path, newline="", encoding=encoding) as f:
             reader = csv.reader(f, delimiter="\t")
             for fname, label in reader:
                 path = os.path.join(images_dir, fname)
-                if all(c in self.stoi for c in label) and os.path.exists(path):
-                    self.samples.append((fname, label))
+                if not all(c in self.stoi for c in label):
+                    continue
+                if not os.path.exists(path):
+                    skipped += 1
+                    continue
+                try:
+                    _ = imread_cv2(path)
+                except Exception:
+                    skipped += 1
+                    continue
+                self.samples.append((fname, label))
 
+        if skipped > 0:
+            print(f"[OCRDatasetAttn] {csv_path}: пропущено {skipped} битых/отсутствующих файлов")
         if len(self.samples) == 0:
             raise RuntimeError(f"В датасете {csv_path} не осталось валидных примеров!")
-        
+
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         fname, label = self.samples[idx]
         path = os.path.join(self.images_dir, fname)
-        img = imread_cv2(path)
+        try:
+            img = imread_cv2(path)
+        except Exception as e:
+            raise IndexError(f"Ошибка чтения изображения {path}: {e}")
 
         if self.transform:
             augmented = self.transform(image=img)
