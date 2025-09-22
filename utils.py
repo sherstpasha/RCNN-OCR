@@ -1,6 +1,66 @@
 import torch
 from model import RCNN
 import torch.nn.functional as F
+import random
+
+def save_checkpoint(
+    path,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    epoch,
+    global_step,
+    best_val_loss,
+    best_val_acc,
+    itos,
+    stoi,
+    config,
+    log_dir,
+):
+    ckpt = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict() if optimizer is not None else None,
+        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+        "scaler_state": scaler.state_dict() if scaler is not None else None,
+        "best_val_loss": best_val_loss,
+        "best_val_acc": best_val_acc,
+        "itos": itos,
+        "stoi": stoi,
+        "config": config,
+        "log_dir": log_dir,
+    }
+    torch.save(ckpt, path)
+
+
+def save_weights(path, model):
+    torch.save(model.state_dict(), path)
+
+
+def load_checkpoint(
+    path, model, optimizer=None, scheduler=None, scaler=None, map_location="auto"
+):
+    if map_location == "auto":
+        map_location = "cuda" if torch.cuda.is_available() else "cpu"
+    ckpt = torch.load(path, map_location=map_location)
+    model.load_state_dict(ckpt["model_state"])
+    if optimizer is not None and ckpt.get("optimizer_state") is not None:
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+    if scheduler is not None and ckpt.get("scheduler_state") is not None:
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+    if scaler is not None and ckpt.get("scaler_state") is not None:
+        scaler.load_state_dict(ckpt["scaler_state"])
+    return ckpt
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 
 def load_crnn(

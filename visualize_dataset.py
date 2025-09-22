@@ -18,12 +18,26 @@ img_height = 32
 img_max_width = 256
 max_len = 10
 
-# --- алфавит (cо спец-токенами) ---
+# --- алфавит ---
 itos, stoi = load_charset("charset.txt")
 
-# --- трансформации ---
+# --- трансформации с аугментациями ---
 transform = A.Compose([
     ResizeAndPadA(img_h=img_height, img_w=img_max_width),
+    A.ShiftScaleRotate(
+        shift_limit=0.03,
+        scale_limit=0.05,
+        rotate_limit=5,
+        border_mode=0,
+        value=(255, 255, 255),
+        p=0.5
+    ),
+    A.RandomBrightnessContrast(
+        brightness_limit=0.2,
+        contrast_limit=0.2,
+        p=0.5
+    ),
+    A.InvertImg(p=0.05),  # маленький шанс инверсии
     A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
     ToTensorV2(),
 ])
@@ -48,29 +62,30 @@ train_loader = DataLoader(
     collate_fn=collate_attn
 )
 
-# --- helpers: без фильтрации спец-токенов! ---
+# --- helpers ---
 def ids_to_tokens_str(ids_row, itos):
-    return " ".join(itos[int(t)] if 0 <= int(t) < len(itos) else f"<UNK:{int(t)}>" for t in ids_row)
+    return " ".join(
+        itos[int(t)] if 0 <= int(t) < len(itos) else f"<UNK:{int(t)}>"
+        for t in ids_row
+    )
 
 # берём батч
 imgs, text_in, target_y, lengths = next(iter(train_loader))
 B = imgs.size(0)
 
 # рисуем
-plt.figure(figsize=(14, 5))
+plt.figure(figsize=(14, 6))
 for i in range(B):
     img = imgs[i].permute(1, 2, 0).cpu().numpy()
-    img = (img * 0.5 + 0.5).clip(0, 1)
+    img = (img * 0.5 + 0.5).clip(0, 1)  # денормализация
 
-    # исходная строка-лейбл из датасета:
-    # её можно получить из train_ds.samples[idx][1], но в батче индексов нет.
-    # Для быстрой проверки выведем token-последовательности:
     ti_str = ids_to_tokens_str(text_in[i].tolist(), itos)
     ty_str = ids_to_tokens_str(target_y[i].tolist(), itos)
     L = int(lengths[i])
 
     plt.subplot(2, B, i + 1)
-    plt.imshow(img); plt.axis("off")
+    plt.imshow(img)
+    plt.axis("off")
     plt.title(f"len={L}")
 
     plt.subplot(2, B, B + i + 1)

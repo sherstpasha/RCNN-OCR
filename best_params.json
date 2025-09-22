@@ -11,5 +11,6 @@
     "p_ShiftScaleRotate": 0.4002319329123872,
     "brightness_limit": 0.1603913800465498,
     "contrast_limit": 0.21538713295649292,
-    "p_BrightnessContrast": 0.09102159869005591
+    "p_BrightnessContrast": 0.09102159869005591,
+    "invert_p": 0.01
 }

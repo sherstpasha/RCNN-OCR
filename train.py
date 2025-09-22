@@ -8,130 +8,18 @@ import torch.cuda.amp as amp
 from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-
 from dataset import (
     OCRDatasetAttn,
     load_charset,
-    ResizeAndPadA,
+    MultiDataset,
+    ProportionalBatchSampler,
+    get_train_transform,
+    get_val_transform,
+    decode_tokens
 )
 from model import RCNN
 from metrics import compute_accuracy, word_error_rate, character_error_rate
-
-
-def set_seed(seed: int = 42):
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-
-
-def get_train_transform(params, img_h, img_w):
-    def suggest(name, default):
-        if isinstance(default, tuple):
-            return (
-                params.get(name, default[0]) if isinstance(params, dict) else default[0]
-            )
-        else:
-            return params.get(name, default) if isinstance(params, dict) else default
-
-    return A.Compose(
-        [
-            ResizeAndPadA(img_h=img_h, img_w=img_w),
-            A.ShiftScaleRotate(
-                shift_limit=suggest("shift_limit", (0.0, 0.05)),
-                scale_limit=suggest("scale_limit", (0.0, 0.1)),
-                rotate_limit=suggest("rotate_limit", (0, 5)),
-                border_mode=0,
-                value=(255, 255, 255),
-                p=suggest("p_ShiftScaleRotate", (0.0, 0.5)),
-            ),
-            A.RandomBrightnessContrast(
-                brightness_limit=suggest("brightness_limit", (0.1, 0.3)),
-                contrast_limit=suggest("contrast_limit", (0.1, 0.3)),
-                p=suggest("p_BrightnessContrast", (0.0, 0.5)),
-            ),
-            A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-            ToTensorV2(),
-        ]
-    )
-
-
-def get_val_transform(img_h, img_w):
-    return A.Compose(
-        [
-            ResizeAndPadA(img_h=img_h, img_w=img_w),
-            A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-            ToTensorV2(),
-        ]
-    )
-
-
-def save_checkpoint(
-    path,
-    model,
-    optimizer,
-    scheduler,
-    scaler,
-    epoch,
-    global_step,
-    best_val_loss,
-    best_val_acc,
-    itos,
-    stoi,
-    config,
-    log_dir,
-):
-    ckpt = {
-        "epoch": epoch,
-        "global_step": global_step,
-        "model_state": model.state_dict(),
-        "optimizer_state": optimizer.state_dict() if optimizer is not None else None,
-        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
-        "scaler_state": scaler.state_dict() if scaler is not None else None,
-        "best_val_loss": best_val_loss,
-        "best_val_acc": best_val_acc,
-        "itos": itos,
-        "stoi": stoi,
-        "config": config,
-        "log_dir": log_dir,
-    }
-    torch.save(ckpt, path)
-
-
-def save_weights(path, model):
-    torch.save(model.state_dict(), path)
-
-
-def load_checkpoint(
-    path, model, optimizer=None, scheduler=None, scaler=None, map_location="auto"
-):
-    if map_location == "auto":
-        map_location = "cuda" if torch.cuda.is_available() else "cpu"
-    ckpt = torch.load(path, map_location=map_location)
-    model.load_state_dict(ckpt["model_state"])
-    if optimizer is not None and ckpt.get("optimizer_state") is not None:
-        optimizer.load_state_dict(ckpt["optimizer_state"])
-    if scheduler is not None and ckpt.get("scheduler_state") is not None:
-        scheduler.load_state_dict(ckpt["scheduler_state"])
-    if scaler is not None and ckpt.get("scaler_state") is not None:
-        scaler.load_state_dict(ckpt["scaler_state"])
-    return ckpt
-
-
-def decode_tokens(ids, itos, pad_id, eos_id, blank_id=None):
-    out = []
-    for t in ids:
-        t = int(t)
-        if t == eos_id:
-            break
-        if t == pad_id or (blank_id is not None and t == blank_id):
-            continue
-        out.append(itos[t])
-    return "".join(out)
+from utils import save_checkpoint, save_weights, load_checkpoint, set_seed
 
 
 def run_training(
@@ -156,6 +44,7 @@ def run_training(
     exp_dir=None,
     resume_path=None,
     save_every=1,
+    train_proportions=None,
 ):
     set_seed(42)
     device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -261,13 +150,27 @@ def run_training(
         stoi, max_len=max_len, drop_blank=True
     )
 
-    train_loader = DataLoader(
-        ConcatDataset(train_sets),
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-        collate_fn=collate_train,
-    )
+    # 🔑 выбор train_loader
+    if train_proportions is not None:
+        assert len(train_proportions) == len(train_sets), \
+            "Длина train_proportions должна совпадать с количеством датасетов"
+        train_dataset = MultiDataset(train_sets)
+        batch_sampler = ProportionalBatchSampler(train_sets, batch_size, train_proportions)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=batch_sampler,
+            num_workers=0,
+            collate_fn=collate_train,
+        )
+    else:
+        train_loader = DataLoader(
+            ConcatDataset(train_sets),
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=0,
+            collate_fn=collate_train,
+        )
+
     val_loader = DataLoader(
         ConcatDataset(val_sets),
         batch_size=batch_size,
@@ -498,16 +401,17 @@ if __name__ == "__main__":
     IMG_W = 256
 
     base_config = dict(
-        train_csvs=[r"C:\shared\orig_cyrillic\train.tsv"],
-        train_roots=[r"C:\shared\orig_cyrillic\train"],
-        val_csvs=[r"C:\shared\orig_cyrillic\test.tsv"],
-        val_roots=[r"C:\shared\orig_cyrillic\test"],
+        train_csvs=[r"C:\shared\orig_cyrillic\train.tsv", r"C:\shared\orig_cyrillic\train.tsv"],
+        train_roots=[r"C:\shared\orig_cyrillic\train", r"C:\shared\orig_cyrillic\train"],
+        val_csvs=[r"C:\shared\orig_cyrillic\test.tsv", r"C:\shared\orig_cyrillic\test.tsv"],
+        val_roots=[r"C:\shared\orig_cyrillic\test", r"C:\shared\orig_cyrillic\test"],
         charset_path="charset.txt",
         img_h=IMG_H,
         img_w=IMG_W,
         device="cuda",
         encoding="utf-8",
-        max_len=25,
+        max_len=40,
+        train_proportions=[0.7, 0.3],
     )
 
     default_params = {

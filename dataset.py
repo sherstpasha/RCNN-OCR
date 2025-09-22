@@ -6,6 +6,8 @@ from torch.utils.data import Dataset
 import numpy as np
 import cv2
 import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import random
 
 
 def imread_cv2(path: str):
@@ -174,3 +176,103 @@ class OCRDatasetAttn(Dataset):
             )
             return imgs, text_in, target_y, lengths
         return collate
+    
+class ProportionalBatchSampler:
+    """
+    Формирует батчи строго по пропорциям.
+    Пример: batch_size=10, proportions=[0.8,0.2] → батч = 8 из ds0 и 2 из ds1.
+    """
+    def __init__(self, datasets, batch_size, proportions):
+        assert abs(sum(proportions) - 1.0) < 1e-6, "Пропорции должны давать сумму = 1"
+        self.datasets = datasets
+        self.batch_size = batch_size
+        self.proportions = proportions
+        self.idxs = [list(range(len(ds))) for ds in datasets]
+        for idxs in self.idxs:
+            random.shuffle(idxs)
+
+    def __iter__(self):
+        while True:
+            batch = []
+            for ds_idx, prop in enumerate(self.proportions):
+                n = int(round(self.batch_size * prop))
+                if n == 0:
+                    continue
+
+                if len(self.idxs[ds_idx]) < n:
+                    self.idxs[ds_idx] = list(range(len(self.datasets[ds_idx])))
+                    random.shuffle(self.idxs[ds_idx])
+
+                chosen = [self.idxs[ds_idx].pop() for _ in range(n)]
+                batch.extend([(ds_idx, c) for c in chosen])
+
+            if len(batch) == 0:
+                break
+
+            random.shuffle(batch)
+            yield batch
+
+    def __len__(self):
+        # ограничение — сколько батчей можно собрать
+        min_batches = min(len(ds) for ds in self.datasets) // max(
+            1, int(self.batch_size * min(self.proportions))
+        )
+        return min_batches
+
+
+class MultiDataset(Dataset):
+    """Обёртка: хранит несколько датасетов, возвращает (dataset_id, sample)."""
+    def __init__(self, datasets):
+        self.datasets = datasets
+
+    def __getitem__(self, index):
+        ds_idx, sample_idx = index
+        return self.datasets[ds_idx][sample_idx]
+
+    def __len__(self):
+        return sum(len(ds) for ds in self.datasets)
+    
+def get_train_transform(params, img_h, img_w):
+    return A.Compose(
+        [
+            ResizeAndPadA(img_h=img_h, img_w=img_w),
+            A.ShiftScaleRotate(
+                shift_limit=round(params.get("shift_limit", 0.03), 4),
+                scale_limit=round(params.get("scale_limit", 0.08), 4),
+                rotate_limit=int(params.get("rotate_limit", 3)),
+                border_mode=0,
+                value=(255, 255, 255),
+                p=round(params.get("p_ShiftScaleRotate", 0.3), 4),
+            ),
+            A.RandomBrightnessContrast(
+                brightness_limit=round(params.get("brightness_limit", 0.2), 4),
+                contrast_limit=round(params.get("contrast_limit", 0.2), 4),
+                p=round(params.get("p_BrightnessContrast", 0.3), 4),
+            ),
+            A.InvertImg(p=round(params.get("invert_p", 0.0), 4)),  # 🔑 теперь как все
+            A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+            ToTensorV2(),
+        ]
+    )
+
+
+def get_val_transform(img_h, img_w):
+    return A.Compose(
+        [
+            ResizeAndPadA(img_h=img_h, img_w=img_w),
+            A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+            ToTensorV2(),
+        ]
+    )
+
+
+def decode_tokens(ids, itos, pad_id, eos_id, blank_id=None):
+    out = []
+    for t in ids:
+        t = int(t)
+        if t == eos_id:
+            break
+        if t == pad_id or (blank_id is not None and t == blank_id):
+            continue
+        out.append(itos[t])
+    return "".join(out)
