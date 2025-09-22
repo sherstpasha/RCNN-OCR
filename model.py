@@ -190,7 +190,7 @@ class RCNN(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d((1, None))  # -> [B, C, 1, W]
 
         enc_dim = self.cnn.out_channels
-        # Две BiLSTM подряд (классическая схема для OCR)
+
         self.enc_rnn = nn.Sequential(
             BidirectionalLSTM(enc_dim, hidden_size, hidden_size),
             BidirectionalLSTM(hidden_size, hidden_size, hidden_size),
@@ -208,7 +208,7 @@ class RCNN(nn.Module):
             pad_id=pad_id,
             blank_id=blank_id,
             dropout_p=0.1,
-            sampling_prob=0.0,  # scheduled sampling OFF по умолчанию
+            sampling_prob=0.0,
         )
 
     def encode(self, x):

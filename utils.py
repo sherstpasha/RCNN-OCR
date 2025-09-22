@@ -3,6 +3,7 @@ from model import RCNN
 import torch.nn.functional as F
 import random
 
+
 def save_checkpoint(
     path,
     model,
@@ -94,11 +95,10 @@ def ctc_greedy_decoder(logits: torch.Tensor, alphabet: str, blank: int = 0):
         список предсказанных строк, список индексов
     """
     if logits.dim() == 3 and logits.shape[0] < logits.shape[1]:
-        # (T, B, C) → (B, T, C)
         logits = logits.permute(1, 0, 2)
 
     B, T, C = logits.shape
-    preds = logits.argmax(dim=2)  # (B, T)
+    preds = logits.argmax(dim=2)
 
     texts, seqs = [], []
     for b in range(B):
@@ -108,7 +108,7 @@ def ctc_greedy_decoder(logits: torch.Tensor, alphabet: str, blank: int = 0):
             p = preds[b, t].item()
             if p != blank and p != prev:
                 seq.append(p)
-                chars.append(alphabet[p - 1])  # сдвиг, т.к. blank=0
+                chars.append(alphabet[p - 1]) 
             prev = p
         texts.append("".join(chars))
         seqs.append(seq)
@@ -116,13 +116,6 @@ def ctc_greedy_decoder(logits: torch.Tensor, alphabet: str, blank: int = 0):
 
 
 def decode(ctc_out, alphabet: str, method: str = "greedy"):
-    """
-    Декодирование выхода CTC.
-    Args:
-        ctc_out: выход модели (T, B, C) или (B, T, C)
-        alphabet: строка символов
-        method: 'greedy' (по умолчанию)
-    """
     if isinstance(ctc_out, tuple):
         ctc_out = ctc_out[0]
 

@@ -178,10 +178,7 @@ class OCRDatasetAttn(Dataset):
         return collate
     
 class ProportionalBatchSampler:
-    """
-    Формирует батчи строго по пропорциям.
-    Пример: batch_size=10, proportions=[0.8,0.2] → батч = 8 из ds0 и 2 из ds1.
-    """
+
     def __init__(self, datasets, batch_size, proportions):
         assert abs(sum(proportions) - 1.0) < 1e-6, "Пропорции должны давать сумму = 1"
         self.datasets = datasets
@@ -213,7 +210,6 @@ class ProportionalBatchSampler:
             yield batch
 
     def __len__(self):
-        # ограничение — сколько батчей можно собрать
         min_batches = min(len(ds) for ds in self.datasets) // max(
             1, int(self.batch_size * min(self.proportions))
         )

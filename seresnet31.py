@@ -46,7 +46,6 @@ class SEBasicBlock(nn.Module):
         self.se = SELayer(planes, reduction)
         self.downsample = downsample
 
-        # DropBlock (активируется если dropblock_p > 0)
         self.dropblock = (
             DropBlock2d(p=dropblock_p, block_size=dropblock_block_size)
             if dropblock_p > 0
@@ -60,7 +59,7 @@ class SEBasicBlock(nn.Module):
         out = self.bn2(self.conv2(out))
 
         out = self.se(out)
-        out = self.dropblock(out)  # 🔹 DropBlock внутри residual
+        out = self.dropblock(out)
 
         if self.downsample is not None:
             identity = self.downsample(x)
