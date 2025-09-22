@@ -8,6 +8,8 @@ import cv2
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 
 
 def imread_cv2(path: str):
@@ -136,36 +138,57 @@ class OCRDatasetAttn(Dataset):
         img_max_width: int = 128,
         encoding: str = "utf-8",
         transform: Optional[callable] = None,
+        num_workers: int = -1,   # 🔑 теперь поддержка -1
     ):
         self.images_dir = images_dir
         self.img_h = img_height
         self.img_w = img_max_width
         self.stoi = stoi
         self.transform = transform
-
         self.samples: List[Tuple[str, str]] = []
-        skipped = 0
+
+        def check_line(row):
+            fname, label = row
+            path = os.path.join(images_dir, fname)
+            if not all(c in self.stoi for c in label):
+                return None
+            if not os.path.exists(path):
+                return None
+            try:
+                _ = imread_cv2(path)  
+            except Exception:
+                return None
+            return (fname, label)
+
         with open(csv_path, newline="", encoding=encoding) as f:
-            reader = csv.reader(f, delimiter="\t")
-            for fname, label in reader:
-                path = os.path.join(images_dir, fname)
-                if not all(c in self.stoi for c in label):
-                    continue
-                if not os.path.exists(path):
+            reader = csv.reader(f, delimiter=",")
+            rows = list(reader)
+
+        if num_workers == -1:
+            workers = os.cpu_count() or 4
+        elif num_workers is None:
+            workers = 8
+        else:
+            workers = max(1, num_workers)
+
+        skipped = 0
+        results = []
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(check_line, row) for row in rows]
+            for fut in tqdm(as_completed(futures), total=len(futures),
+                            desc=f"Проверка {os.path.basename(csv_path)}"):
+                res = fut.result()
+                if res is not None:
+                    results.append(res)
+                else:
                     skipped += 1
-                    continue
-                try:
-                    _ = imread_cv2(path)
-                except Exception:
-                    skipped += 1
-                    continue
-                self.samples.append((fname, label))
+
+        self.samples = results
 
         if skipped > 0:
             print(f"[OCRDatasetAttn] {csv_path}: пропущено {skipped} битых/отсутствующих файлов")
         if len(self.samples) == 0:
             raise RuntimeError(f"В датасете {csv_path} не осталось валидных примеров!")
-
     def __len__(self):
         return len(self.samples)
 
