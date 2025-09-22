@@ -147,9 +147,13 @@ class OCRDatasetAttn(Dataset):
         with open(csv_path, newline="", encoding=encoding) as f:
             reader = csv.reader(f, delimiter="\t")
             for fname, label in reader:
-                if all(c in self.stoi for c in label):
+                path = os.path.join(images_dir, fname)
+                if all(c in self.stoi for c in label) and os.path.exists(path):
                     self.samples.append((fname, label))
 
+        if len(self.samples) == 0:
+            raise RuntimeError(f"В датасете {csv_path} не осталось валидных примеров!")
+        
     def __len__(self):
         return len(self.samples)
 
