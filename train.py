@@ -21,13 +21,33 @@ from model import RCNN
 from metrics import compute_accuracy, word_error_rate, character_error_rate
 from utils import save_checkpoint, save_weights, load_checkpoint, set_seed
 
+from torch.utils.data import random_split
+
+def split_train_val(csvs, roots, stoi, img_h, img_w, transform, encoding="utf-8", val_size=3000):
+    train_sets, val_sets = [], []
+    for c, r in zip(csvs, roots):
+        full_ds = OCRDatasetAttn(
+            c, r, stoi,
+            img_height=img_h,
+            img_max_width=img_w,
+            transform=transform,
+            encoding=encoding,
+        )
+        n_val = min(val_size, len(full_ds))
+        n_train = len(full_ds) - n_val
+        if n_train <= 0:
+            raise ValueError(f"В датасете {c} всего {len(full_ds)} примеров, меньше чем {val_size}")
+        train_ds, val_ds = random_split(full_ds, [n_train, n_val])
+        train_sets.append(train_ds)
+        val_sets.append(val_ds)
+    return train_sets, val_sets
 
 def run_training(
     train_csvs,
     train_roots,
-    val_csvs,
-    val_roots,
-    charset_path,
+    val_csvs=None,
+    val_roots=None,
+    charset_path=None,
     img_h=64,
     img_w=256,
     batch_size=32,
@@ -45,10 +65,12 @@ def run_training(
     resume_path=None,
     save_every=1,
     train_proportions=None,
+    val_size=3000,
 ):
     set_seed(42)
     device = torch.device(device if torch.cuda.is_available() else "cpu")
 
+    # === директории ===
     if resume_path is not None:
         exp_dir = os.path.dirname(resume_path)
         os.makedirs(exp_dir, exist_ok=True)
@@ -70,7 +92,7 @@ def run_training(
     best_acc_weights_path = os.path.join(exp_dir, "best_acc_weights.pth")
     last_weights_path = os.path.join(exp_dir, "last_weights.pth")
 
-    # --- charset ---
+    # === charset ===
     itos, stoi = load_charset(charset_path)
     PAD = stoi["<PAD>"]
     SOS = stoi["<SOS>"]
@@ -78,6 +100,7 @@ def run_training(
     BLANK = stoi.get("<BLANK>", None)
     num_classes = len(itos)
 
+    # === модель ===
     model = RCNN(
         num_classes=num_classes,
         hidden_size=256,
@@ -89,7 +112,7 @@ def run_training(
 
     criterion = nn.CrossEntropyLoss(ignore_index=PAD)
 
-    # optimizer
+    # === optimizer ===
     if optimizer_name == "Adam":
         optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     elif optimizer_name == "AdamW":
@@ -101,7 +124,7 @@ def run_training(
     else:
         raise ValueError(f"Unknown optimizer: {optimizer_name}")
 
-    # scheduler
+    # === scheduler ===
     if scheduler_name == "ReduceLROnPlateau":
         scheduler = ReduceLROnPlateau(
             optimizer, mode="min", factor=0.5, patience=3, verbose=False, min_lr=1e-7
@@ -115,47 +138,51 @@ def run_training(
 
     scaler = amp.GradScaler()
 
-    # dataloaders
+    # === датасеты ===
     val_transform = get_val_transform(img_h, img_w)
 
-    train_sets = [
-        OCRDatasetAttn(
-            c,
-            r,
-            stoi,
-            img_height=img_h,
-            img_max_width=img_w,
-            transform=train_transform,
+    if val_csvs and val_roots:
+        # как раньше
+        train_sets = [
+            OCRDatasetAttn(
+                c, r, stoi,
+                img_height=img_h,
+                img_max_width=img_w,
+                transform=train_transform,
+                encoding=encoding,
+            )
+            for c, r in zip(train_csvs, train_roots)
+        ]
+        val_sets = [
+            OCRDatasetAttn(
+                c, r, stoi,
+                img_height=img_h,
+                img_max_width=img_w,
+                transform=val_transform,
+                encoding=encoding,
+            )
+            for c, r in zip(val_csvs, val_roots)
+        ]
+    else:
+        train_sets, val_sets = split_train_val(
+            train_csvs, train_roots, stoi,
+            img_h, img_w,
+            train_transform, val_transform,
             encoding=encoding,
+            val_size=val_size
         )
-        for c, r in zip(train_csvs, train_roots)
-    ]
-    val_sets = [
-        OCRDatasetAttn(
-            c,
-            r,
-            stoi,
-            img_height=img_h,
-            img_max_width=img_w,
-            transform=val_transform,
-            encoding=encoding,
-        )
-        for c, r in zip(val_csvs, val_roots)
-    ]
 
-    collate_train = OCRDatasetAttn.make_collate_attn(
-        stoi, max_len=max_len, drop_blank=True
-    )
-    collate_val = OCRDatasetAttn.make_collate_attn(
-        stoi, max_len=max_len, drop_blank=True
-    )
+    collate_train = OCRDatasetAttn.make_collate_attn(stoi, max_len=max_len, drop_blank=True)
+    collate_val = OCRDatasetAttn.make_collate_attn(stoi, max_len=max_len, drop_blank=True)
 
-    # 🔑 выбор train_loader
+    # === train_loader ===
     if train_proportions is not None:
-        assert len(train_proportions) == len(train_sets), \
-            "Длина train_proportions должна совпадать с количеством датасетов"
+        total = sum(train_proportions)
+        proportions = [p / total for p in train_proportions]
+        assert len(proportions) == len(train_sets), "train_proportions != num train_sets"
+
         train_dataset = MultiDataset(train_sets)
-        batch_sampler = ProportionalBatchSampler(train_sets, batch_size, train_proportions)
+        batch_sampler = ProportionalBatchSampler(train_sets, batch_size, proportions)
         train_loader = DataLoader(
             train_dataset,
             batch_sampler=batch_sampler,
