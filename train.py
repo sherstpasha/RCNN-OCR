@@ -23,21 +23,26 @@ from utils import save_checkpoint, save_weights, load_checkpoint, set_seed
 
 from torch.utils.data import random_split
 
-def split_train_val(csvs, roots, stoi, img_h, img_w, transform, encoding="utf-8", val_size=3000):
+def split_train_val(csvs, roots, stoi, img_h, img_w, train_transform, val_transform, encoding="utf-8", val_size=3000):
     train_sets, val_sets = [], []
     for c, r in zip(csvs, roots):
         full_ds = OCRDatasetAttn(
             c, r, stoi,
             img_height=img_h,
             img_max_width=img_w,
-            transform=transform,
+            transform=None,
             encoding=encoding,
         )
         n_val = min(val_size, len(full_ds))
         n_train = len(full_ds) - n_val
         if n_train <= 0:
             raise ValueError(f"В датасете {c} всего {len(full_ds)} примеров, меньше чем {val_size}")
+
         train_ds, val_ds = random_split(full_ds, [n_train, n_val])
+
+        train_ds.dataset.transform = train_transform
+        val_ds.dataset.transform = val_transform
+
         train_sets.append(train_ds)
         val_sets.append(val_ds)
     return train_sets, val_sets
@@ -430,8 +435,8 @@ if __name__ == "__main__":
     base_config = dict(
         train_csvs=[r"C:\shared\orig_cyrillic\train.tsv", r"C:\shared\orig_cyrillic\train.tsv"],
         train_roots=[r"C:\shared\orig_cyrillic\train", r"C:\shared\orig_cyrillic\train"],
-        val_csvs=[r"C:\shared\orig_cyrillic\test.tsv", r"C:\shared\orig_cyrillic\test.tsv"],
-        val_roots=[r"C:\shared\orig_cyrillic\test", r"C:\shared\orig_cyrillic\test"],
+        val_csvs=None,
+        val_roots=None,
         charset_path="charset.txt",
         img_h=IMG_H,
         img_w=IMG_W,
