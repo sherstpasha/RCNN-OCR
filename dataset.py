@@ -37,7 +37,7 @@ def load_charset(charset_path: str):
     itos = []
     with open(charset_path, "r", encoding="utf-8") as f:
         for line in f:
-            tok = line.strip()
+            tok = line.rstrip("\n")
             if tok == "":
                 continue
             itos.append(tok)
@@ -139,6 +139,9 @@ def pack_attention_targets(texts, stoi, max_len, drop_blank=True):
     return text_in, target_y, lengths
 
 
+from collections import Counter
+
+
 class OCRDatasetAttn(Dataset):
     def __init__(
         self,
@@ -158,23 +161,83 @@ class OCRDatasetAttn(Dataset):
         self.transform = transform
         self.samples: List[Tuple[str, str]] = []
 
+        # Диагностика причин пропуска
+        reasons = {
+            "bad_row": 0,  # строка не из 2 столбцов
+            "empty_fname": 0,  # пустое имя файла
+            "empty_label": 0,  # пустая метка
+            "charset": 0,  # символы вне charset
+            "missing_path": 0,  # файл не найден
+            "readfail": 0,  # ошибка чтения изображения
+        }
+        examples = {k: [] for k in reasons}
+        EX_MAX = 8
+
+        # сбор отсутствующих символов
+        missing_chars = Counter()
+
+        def norm(s: str) -> str:
+            # убираем BOM/пробелы, нормализуем слеши
+            return s.strip().replace("\ufeff", "").replace("\\", "/")
+
         def check_line(row):
-            fname, label = row
-            path = os.path.join(images_dir, fname)
-            if not all(c in self.stoi for c in label):
+            # ожидаем TSV: [fname, label]
+            if len(row) < 2:
+                reasons["bad_row"] += 1
+                if len(examples["bad_row"]) < EX_MAX:
+                    examples["bad_row"].append(row)
                 return None
+
+            fname, label = norm(row[0]), norm(row[1])
+
+            if fname == "":
+                reasons["empty_fname"] += 1
+                if len(examples["empty_fname"]) < EX_MAX:
+                    examples["empty_fname"].append(row)
+                return None
+
+            if label == "":
+                reasons["empty_label"] += 1
+                if len(examples["empty_label"]) < EX_MAX:
+                    examples["empty_label"].append(fname)
+                return None
+
+            # проверка charset + сбор недостающих символов
+            missing = [c for c in label if c not in self.stoi]
+            if missing:
+                reasons["charset"] += 1
+                missing_chars.update(missing)
+                if len(examples["charset"]) < EX_MAX:
+                    uniq = "".join(sorted(set(missing)))[:20]
+                    examples["charset"].append((fname, label[:50], uniq))
+                return None
+
+            path = (
+                os.path.join(images_dir, fname) if not os.path.isabs(fname) else fname
+            )
             if not os.path.exists(path):
+                reasons["missing_path"] += 1
+                if len(examples["missing_path"]) < EX_MAX:
+                    examples["missing_path"].append(path)
                 return None
+
+            # проверка чтения
             try:
                 _ = imread_cv2(path)
-            except Exception:
+            except Exception as e:
+                reasons["readfail"] += 1
+                if len(examples["readfail"]) < EX_MAX:
+                    examples["readfail"].append(f"{fname} :: {type(e).__name__}")
                 return None
+
             return (fname, label)
 
+        # читаем TSV
         with open(csv_path, newline="", encoding=encoding) as f:
             reader = csv.reader(f, delimiter="\t")
             rows = list(reader)
 
+        # число воркеров
         if num_workers == -1:
             workers = os.cpu_count() or 4
         elif num_workers is None:
@@ -190,6 +253,7 @@ class OCRDatasetAttn(Dataset):
                 as_completed(futures),
                 total=len(futures),
                 desc=f"Проверка {os.path.basename(csv_path)}",
+                leave=False,  # прогресс-бар исчезает после завершения
             ):
                 res = fut.result()
                 if res is not None:
@@ -199,10 +263,31 @@ class OCRDatasetAttn(Dataset):
 
         self.samples = results
 
+        # сводка причин
         if skipped > 0:
-            print(
-                f"[OCRDatasetAttn] {csv_path}: пропущено {skipped} битых/отсутствующих файлов"
-            )
+            print(f"[OCRDatasetAttn] {csv_path}: пропущено {skipped} записей.")
+            for k in [
+                "bad_row",
+                "empty_fname",
+                "empty_label",
+                "charset",
+                "missing_path",
+                "readfail",
+            ]:
+                if reasons[k] > 0:
+                    print(f"  - {k}: {reasons[k]}")
+                    if examples[k]:
+                        print(f"    примеры: {examples[k][:EX_MAX]}")
+
+            # подробности по отсутствующим символам
+            if reasons["charset"] > 0 and missing_chars:
+                print("  Отсутствующие символы (TOP 30):")
+                for ch, cnt in missing_chars.most_common(30):
+                    code = ord(ch)
+                    print(f"    '{ch}' (U+{code:04X}, repr={repr(ch)}): {cnt} раз(а)")
+                uniq_preview = "".join(sorted(missing_chars.keys()))
+                print(f"  Все отсутствующие (урезано): {repr(uniq_preview[:200])}")
+
         if len(self.samples) == 0:
             raise RuntimeError(f"В датасете {csv_path} не осталось валидных примеров!")
 

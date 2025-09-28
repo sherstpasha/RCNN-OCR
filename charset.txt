@@ -1,6 +1,7 @@
 <PAD>
 <SOS>
 <EOS>
+ 
 a
 b
 c
