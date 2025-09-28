@@ -58,6 +58,7 @@ checkpoints/
 *.pth
 *.db
 events.out.tfevents.*
+exp*/
 
 # Coverage reports
 .coverage

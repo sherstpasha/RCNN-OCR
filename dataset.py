@@ -1,14 +1,15 @@
-import os
 import csv
-from typing import List, Tuple, Optional
-import torch
-from torch.utils.data import Dataset
-import numpy as np
-import cv2
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
+import os
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Optional, Tuple
+
+import albumentations as A
+import cv2
+import numpy as np
+import torch
+from albumentations.pytorch import ToTensorV2
+from torch.utils.data import Dataset
 from tqdm import tqdm
 
 
@@ -18,7 +19,7 @@ def imread_cv2(path: str):
     if img is None:
         raise FileNotFoundError(f"Failed to read image: {path}")
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    return img 
+    return img
 
 
 def load_charset(charset_path: str):
@@ -43,9 +44,17 @@ def load_charset(charset_path: str):
     stoi = {s: i for i, s in enumerate(itos)}
     return itos, stoi
 
+
 class ResizeAndPadA(A.ImageOnlyTransform):
-    def __init__(self, img_h=32, img_w=256, align_h="left", align_v="center",
-                 always_apply=True, p=1.0):
+    def __init__(
+        self,
+        img_h=32,
+        img_w=256,
+        align_h="left",
+        align_v="center",
+        always_apply=True,
+        p=1.0,
+    ):
         super().__init__(always_apply, p)
         self.img_h = int(img_h)
         self.img_w = int(img_w)
@@ -85,14 +94,15 @@ class ResizeAndPadA(A.ImageOnlyTransform):
             y0 = 0
         elif self.align_v == "bottom":
             y0 = self.img_h - new_h
-        else: 
+        else:
             y0 = (self.img_h - new_h) // 2
         x0 = max(0, min(x0, self.img_w - new_w))
         y0 = max(0, min(y0, self.img_h - new_h))
 
-        canvas[y0:y0+new_h, x0:x0+new_w] = img_resized
+        canvas[y0 : y0 + new_h, x0 : x0 + new_w] = img_resized
         return canvas
-    
+
+
 def pack_attention_targets(texts, stoi, max_len, drop_blank=True):
     PAD = stoi["<PAD>"]
     SOS = stoi["<SOS>"]
@@ -101,12 +111,12 @@ def pack_attention_targets(texts, stoi, max_len, drop_blank=True):
 
     B = len(texts)
     T = max_len + 1
-    
-    text_in  = torch.full((B, T), PAD, dtype=torch.long)
+
+    text_in = torch.full((B, T), PAD, dtype=torch.long)
     text_in[:, 0] = SOS
 
     target_y = torch.full((B, T), PAD, dtype=torch.long)
-    lengths  = torch.zeros(B, dtype=torch.long)
+    lengths = torch.zeros(B, dtype=torch.long)
 
     for i, s in enumerate(texts):
         ids = []
@@ -118,15 +128,16 @@ def pack_attention_targets(texts, stoi, max_len, drop_blank=True):
                 continue
             ids.append(idx)
 
-        L = min(len(ids), max_len) 
+        L = min(len(ids), max_len)
         if L > 0:
-            text_in[i, 1:1+L] = torch.tensor(ids[:L], dtype=torch.long)
-            target_y[i, :L] = torch.tensor(ids[:L], dtype=torch.long) 
+            text_in[i, 1 : 1 + L] = torch.tensor(ids[:L], dtype=torch.long)
+            target_y[i, :L] = torch.tensor(ids[:L], dtype=torch.long)
 
-        target_y[i, L] = EOS 
+        target_y[i, L] = EOS
         lengths[i] = L + 1
 
     return text_in, target_y, lengths
+
 
 class OCRDatasetAttn(Dataset):
     def __init__(
@@ -138,7 +149,7 @@ class OCRDatasetAttn(Dataset):
         img_max_width: int = 128,
         encoding: str = "utf-8",
         transform: Optional[callable] = None,
-        num_workers: int = -1,   # 🔑 теперь поддержка -1
+        num_workers: int = -1,
     ):
         self.images_dir = images_dir
         self.img_h = img_height
@@ -155,13 +166,13 @@ class OCRDatasetAttn(Dataset):
             if not os.path.exists(path):
                 return None
             try:
-                _ = imread_cv2(path)  
+                _ = imread_cv2(path)
             except Exception:
                 return None
             return (fname, label)
 
         with open(csv_path, newline="", encoding=encoding) as f:
-            reader = csv.reader(f, delimiter=",")
+            reader = csv.reader(f, delimiter="\t")
             rows = list(reader)
 
         if num_workers == -1:
@@ -175,8 +186,11 @@ class OCRDatasetAttn(Dataset):
         results = []
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = [ex.submit(check_line, row) for row in rows]
-            for fut in tqdm(as_completed(futures), total=len(futures),
-                            desc=f"Проверка {os.path.basename(csv_path)}"):
+            for fut in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc=f"Проверка {os.path.basename(csv_path)}",
+            ):
                 res = fut.result()
                 if res is not None:
                     results.append(res)
@@ -186,9 +200,12 @@ class OCRDatasetAttn(Dataset):
         self.samples = results
 
         if skipped > 0:
-            print(f"[OCRDatasetAttn] {csv_path}: пропущено {skipped} битых/отсутствующих файлов")
+            print(
+                f"[OCRDatasetAttn] {csv_path}: пропущено {skipped} битых/отсутствующих файлов"
+            )
         if len(self.samples) == 0:
             raise RuntimeError(f"В датасете {csv_path} не осталось валидных примеров!")
+
     def __len__(self):
         return len(self.samples)
 
@@ -208,7 +225,7 @@ class OCRDatasetAttn(Dataset):
 
         return tensor, label
 
-    @staticmethod   
+    @staticmethod
     def make_collate_attn(stoi, max_len: int, drop_blank: bool = True):
         def collate(batch):
             imgs, labels_text = zip(*batch)
@@ -217,8 +234,10 @@ class OCRDatasetAttn(Dataset):
                 labels_text, stoi=stoi, max_len=max_len, drop_blank=drop_blank
             )
             return imgs, text_in, target_y, lengths
+
         return collate
-    
+
+
 class ProportionalBatchSampler:
 
     def __init__(self, datasets, batch_size, proportions):
@@ -259,7 +278,6 @@ class ProportionalBatchSampler:
 
 
 class MultiDataset(Dataset):
-    """Обёртка: хранит несколько датасетов, возвращает (dataset_id, sample)."""
     def __init__(self, datasets):
         self.datasets = datasets
 
@@ -269,7 +287,8 @@ class MultiDataset(Dataset):
 
     def __len__(self):
         return sum(len(ds) for ds in self.datasets)
-    
+
+
 def get_train_transform(params, img_h, img_w):
     return A.Compose(
         [

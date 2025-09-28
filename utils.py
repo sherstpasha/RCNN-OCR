@@ -1,7 +1,9 @@
-import torch
-from model import RCNN
-import torch.nn.functional as F
 import random
+
+import torch
+import torch.nn.functional as F
+
+from model import RCNN
 
 
 def save_checkpoint(
@@ -55,6 +57,7 @@ def load_checkpoint(
         scaler.load_state_dict(ckpt["scaler_state"])
     return ckpt
 
+
 def set_seed(seed: int = 42):
     random.seed(seed)
     torch.manual_seed(seed)
@@ -66,21 +69,53 @@ def set_seed(seed: int = 42):
 
 def load_crnn(
     checkpoint_path: str,
-    img_height: int,
-    img_width: int,
-    num_classes: int,
-    device: torch.device = None,
-    pretrained: bool = False,
-    transform: str = "none",
+    itos: list[str] | None = None,
+    stoi: dict | None = None,
+    hidden_size: int = 256,
+    sos_token: str = "<SOS>",
+    eos_token: str = "<EOS>",
+    pad_token: str = "<PAD>",
+    blank_token: str | None = "<BLANK>",
+    device: torch.device | None = None,
+    eval_mode: bool = True,
 ) -> RCNN:
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = RCNN(
-        img_height, img_width, num_classes, pretrained=pretrained, transform=transform
-    ).to(device)
+
     state = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(state)
-    model.eval()
+
+    if isinstance(state, dict) and "model_state" in state:
+        ckpt = state
+        model_state = ckpt["model_state"]
+        if itos is None:
+            itos = ckpt.get("itos")
+        if stoi is None:
+            stoi = ckpt.get("stoi")
+    else:
+        model_state = state
+
+    assert (
+        itos is not None and stoi is not None
+    ), "Нужны itos/stoi: передай явно или используй полный чекпойнт, внутри которого они сохранены."
+
+    num_classes = len(itos)
+    PAD = stoi[pad_token]
+    SOS = stoi[sos_token]
+    EOS = stoi[eos_token]
+    BLANK = stoi.get(blank_token, None) if blank_token is not None else None
+
+    model = RCNN(
+        num_classes=num_classes,
+        hidden_size=hidden_size,
+        sos_id=SOS,
+        eos_id=EOS,
+        pad_id=PAD,
+        blank_id=BLANK,
+    ).to(device)
+
+    model.load_state_dict(model_state, strict=True)
+    if eval_mode:
+        model.eval()
     return model
 
 
@@ -108,7 +143,7 @@ def ctc_greedy_decoder(logits: torch.Tensor, alphabet: str, blank: int = 0):
             p = preds[b, t].item()
             if p != blank and p != prev:
                 seq.append(p)
-                chars.append(alphabet[p - 1]) 
+                chars.append(alphabet[p - 1])
             prev = p
         texts.append("".join(chars))
         seqs.append(seq)

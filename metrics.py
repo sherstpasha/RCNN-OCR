@@ -1,11 +1,3 @@
-# metrics.py
-"""
-Метрики для оценки OCR: Character Error Rate (CER) и Word Error Rate (WER).
-Используются готовые библиотеки: python-Levenshtein и jiwer.
-Установить их можно с помощью:
-    pip install python-Levenshtein jiwer
-"""
-
 import Levenshtein as lev
 from jiwer import wer as jiwer_wer
 
