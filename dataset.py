@@ -324,7 +324,6 @@ class OCRDatasetAttn(Dataset):
 
 
 class ProportionalBatchSampler:
-
     def __init__(self, datasets, batch_size, proportions):
         assert abs(sum(proportions) - 1.0) < 1e-6, "Пропорции должны давать сумму = 1"
         self.datasets = datasets
@@ -335,7 +334,8 @@ class ProportionalBatchSampler:
             random.shuffle(idxs)
 
     def __iter__(self):
-        while True:
+        n_batches = len(self)
+        for _ in range(n_batches):
             batch = []
             for ds_idx, prop in enumerate(self.proportions):
                 n = int(round(self.batch_size * prop))
@@ -349,15 +349,14 @@ class ProportionalBatchSampler:
                 chosen = [self.idxs[ds_idx].pop() for _ in range(n)]
                 batch.extend([(ds_idx, c) for c in chosen])
 
-            if len(batch) == 0:
-                break
-
             random.shuffle(batch)
             yield batch
 
     def __len__(self):
-        min_batches = min(len(ds) for ds in self.datasets) // max(
-            1, int(self.batch_size * min(self.proportions))
+        min_batches = min(
+            len(ds) // max(1, int(round(self.batch_size * prop)))
+            for ds, prop in zip(self.datasets, self.proportions)
+            if prop > 0
         )
         return min_batches
 
