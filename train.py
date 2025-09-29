@@ -376,7 +376,6 @@ def run_training(cfg: Config, device: str = "cuda"):
             writer.add_scalar("LR", optimizer.param_groups[0]["lr"], global_step)
             global_step += 1
 
-            # обновляем прогресс-бар
             pbar.set_postfix(
                 loss=f"{loss_val:.4f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}"
             )
