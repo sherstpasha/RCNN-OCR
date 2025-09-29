@@ -3,6 +3,7 @@ import os
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Tuple
+from collections import Counter, defaultdict
 
 import albumentations as A
 import cv2
@@ -12,6 +13,21 @@ from albumentations.pytorch import ToTensorV2
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
+
+def build_file_index(roots, exts={".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}):
+    if isinstance(roots, str):
+        roots = [roots]
+    index = defaultdict(list)
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                ext = os.path.splitext(fn)[1].lower()
+                if exts and ext not in exts:
+                    continue
+                index[fn.lower()].append(os.path.join(dirpath, fn))
+    return index
 
 def imread_cv2(path: str):
     data = np.fromfile(path, dtype=np.uint8)
@@ -139,20 +155,39 @@ def pack_attention_targets(texts, stoi, max_len, drop_blank=True):
     return text_in, target_y, lengths
 
 
-from collections import Counter
+def build_file_index(roots, exts={".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}):
+    if isinstance(roots, str):
+        roots = [roots]
+    index = defaultdict(list)
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                ext = os.path.splitext(fn)[1].lower()
+                if exts and ext not in exts:
+                    continue
+                index[fn.lower()].append(os.path.join(dirpath, fn))
+    return index
 
 
 class OCRDatasetAttn(Dataset):
     def __init__(
         self,
         csv_path: str,
-        images_dir: str,
+        images_dir: str | list,
         stoi: dict,
         img_height: int = 32,
         img_max_width: int = 128,
         encoding: str = "utf-8",
         transform: Optional[callable] = None,
         num_workers: int = -1,
+        delimiter: str | None = None,
+        has_header: bool | None = None,
+        strict_charset: bool = True,
+        validate_image: bool = True,
+        max_len: Optional[int] = None,
+        strict_max_len: bool = True,
     ):
         self.images_dir = images_dir
         self.img_h = img_height
@@ -160,154 +195,47 @@ class OCRDatasetAttn(Dataset):
         self.stoi = stoi
         self.transform = transform
         self.samples: List[Tuple[str, str]] = []
+        self._file_index = build_file_index(images_dir)
+        self._encoding = encoding
+        self._delimiter = delimiter if delimiter is not None else ("\t" if csv_path.lower().endswith(".tsv") else ",")
+        self._has_header = has_header
+        self._strict_charset = strict_charset
+        self._validate_image = validate_image
+        self._max_len = max_len
+        self._strict_max_len = strict_max_len
 
-        # Диагностика причин пропуска
-        reasons = {
-            "bad_row": 0,  # строка не из 2 столбцов
-            "empty_fname": 0,  # пустое имя файла
-            "empty_label": 0,  # пустая метка
-            "charset": 0,  # символы вне charset
-            "missing_path": 0,  # файл не найден
-            "readfail": 0,  # ошибка чтения изображения
+        self._reasons = {
+            "bad_row": 0, "empty_fname": 0, "empty_label": 0,
+            "charset": 0, "too_long": 0,
+            "missing_path": 0, "ambiguous": 0, "readfail": 0,
         }
-        examples = {k: [] for k in reasons}
-        EX_MAX = 8
+        self._examples = {k: [] for k in self._reasons}
+        self._EX_MAX = 8
+        self._missing_chars = Counter()
 
-        # сбор отсутствующих символов
-        missing_chars = Counter()
+        rows = self._read_rows(csv_path)
+        self._maybe_detect_header(rows)
+        self._build_samples(rows, num_workers)
+        self._print_summary(csv_path)
 
-        def norm(s: str) -> str:
-            # убираем BOM/пробелы, нормализуем слеши
-            return s.strip().replace("\ufeff", "").replace("\\", "/")
-
-        def check_line(row):
-            # ожидаем TSV: [fname, label]
-            if len(row) < 2:
-                reasons["bad_row"] += 1
-                if len(examples["bad_row"]) < EX_MAX:
-                    examples["bad_row"].append(row)
-                return None
-
-            fname, label = norm(row[0]), norm(row[1])
-
-            if fname == "":
-                reasons["empty_fname"] += 1
-                if len(examples["empty_fname"]) < EX_MAX:
-                    examples["empty_fname"].append(row)
-                return None
-
-            if label == "":
-                reasons["empty_label"] += 1
-                if len(examples["empty_label"]) < EX_MAX:
-                    examples["empty_label"].append(fname)
-                return None
-
-            # проверка charset + сбор недостающих символов
-            missing = [c for c in label if c not in self.stoi]
-            if missing:
-                reasons["charset"] += 1
-                missing_chars.update(missing)
-                if len(examples["charset"]) < EX_MAX:
-                    uniq = "".join(sorted(set(missing)))[:20]
-                    examples["charset"].append((fname, label[:50], uniq))
-                return None
-
-            path = (
-                os.path.join(images_dir, fname) if not os.path.isabs(fname) else fname
-            )
-            if not os.path.exists(path):
-                reasons["missing_path"] += 1
-                if len(examples["missing_path"]) < EX_MAX:
-                    examples["missing_path"].append(path)
-                return None
-
-            # проверка чтения
-            try:
-                _ = imread_cv2(path)
-            except Exception as e:
-                reasons["readfail"] += 1
-                if len(examples["readfail"]) < EX_MAX:
-                    examples["readfail"].append(f"{fname} :: {type(e).__name__}")
-                return None
-
-            return (fname, label)
-
-        # читаем TSV
-        with open(csv_path, newline="", encoding=encoding) as f:
-            reader = csv.reader(f, delimiter="\t")
-            rows = list(reader)
-
-        # число воркеров
-        if num_workers == -1:
-            workers = os.cpu_count() or 4
-        elif num_workers is None:
-            workers = 8
-        else:
-            workers = max(1, num_workers)
-
-        skipped = 0
-        results = []
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = [ex.submit(check_line, row) for row in rows]
-            for fut in tqdm(
-                as_completed(futures),
-                total=len(futures),
-                desc=f"Проверка {os.path.basename(csv_path)}",
-                leave=False,  # прогресс-бар исчезает после завершения
-            ):
-                res = fut.result()
-                if res is not None:
-                    results.append(res)
-                else:
-                    skipped += 1
-
-        self.samples = results
-
-        # сводка причин
-        if skipped > 0:
-            print(f"[OCRDatasetAttn] {csv_path}: пропущено {skipped} записей.")
-            for k in [
-                "bad_row",
-                "empty_fname",
-                "empty_label",
-                "charset",
-                "missing_path",
-                "readfail",
-            ]:
-                if reasons[k] > 0:
-                    print(f"  - {k}: {reasons[k]}")
-                    if examples[k]:
-                        print(f"    примеры: {examples[k][:EX_MAX]}")
-
-            # подробности по отсутствующим символам
-            if reasons["charset"] > 0 and missing_chars:
-                print("  Отсутствующие символы (TOP 30):")
-                for ch, cnt in missing_chars.most_common(30):
-                    code = ord(ch)
-                    print(f"    '{ch}' (U+{code:04X}, repr={repr(ch)}): {cnt} раз(а)")
-                uniq_preview = "".join(sorted(missing_chars.keys()))
-                print(f"  Все отсутствующие (урезано): {repr(uniq_preview[:200])}")
-
-        if len(self.samples) == 0:
+        if not self.samples:
             raise RuntimeError(f"В датасете {csv_path} не осталось валидных примеров!")
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        fname, label = self.samples[idx]
-        path = os.path.join(self.images_dir, fname)
+        abs_path, label = self.samples[idx]
         try:
-            img = imread_cv2(path)
+            img = imread_cv2(abs_path)
         except Exception as e:
-            raise IndexError(f"Ошибка чтения изображения {path}: {e}")
+            raise IndexError(f"Ошибка чтения изображения {abs_path}: {e}")
 
         if self.transform:
             augmented = self.transform(image=img)
             tensor = augmented["image"]
         else:
             tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
-
         return tensor, label
 
     @staticmethod
@@ -319,9 +247,157 @@ class OCRDatasetAttn(Dataset):
                 labels_text, stoi=stoi, max_len=max_len, drop_blank=drop_blank
             )
             return imgs, text_in, target_y, lengths
-
         return collate
 
+    def _read_rows(self, csv_path: str):
+        with open(csv_path, newline="", encoding=self._encoding) as f:
+            reader = csv.reader(f, delimiter=self._delimiter)
+            rows = list(reader)
+        return rows
+
+    def _maybe_detect_header(self, rows: list[list[str]]):
+        if self._has_header is not None or not rows:
+            return
+        head0 = str(rows[0][0]).strip().lower()
+        self._has_header = head0 in {"file", "filename", "image", "path", "img", "name"}
+        if self._has_header:
+            rows.pop(0)
+        self._rows = rows
+
+        if not hasattr(self, "_rows"):
+            self._rows = rows
+
+    @staticmethod
+    def _norm_label(s: str) -> str:
+
+        return s.replace("\u00A0", " ").strip().replace("\ufeff", "")
+
+    @staticmethod
+    def _norm_fname(s: str) -> str:
+        return s.strip().replace("\ufeff", "").replace("\\", "/")
+
+    def _resolve_path(self, fname: str) -> Optional[str]:
+        if os.path.isabs(fname) and os.path.exists(fname):
+            return fname
+
+        if isinstance(self.images_dir, str):
+            p = os.path.join(self.images_dir, fname)
+            if os.path.exists(p):
+                return p
+        else:
+            for root in self.images_dir:
+                p = os.path.join(root, fname)
+                if os.path.exists(p):
+                    return p
+
+        base = os.path.basename(fname).lower()
+        candidates = self._file_index.get(base, [])
+        if not candidates:
+            return None
+        if len(candidates) > 1:
+            self._reasons["ambiguous"] += 1
+            if len(self._examples["ambiguous"]) < self._EX_MAX:
+                self._examples["ambiguous"].append((fname, candidates[:3]))
+        return candidates[0]
+
+    def _effective_len(self, label: str) -> int:
+        if not self._strict_charset:
+            return len(label)
+        return sum(1 for c in label if c in self.stoi)
+
+    def _validate_row(self, row: list[str]) -> Optional[tuple[str, str]]:
+        if len(row) < 2:
+            self._reasons["bad_row"] += 1
+            if len(self._examples["bad_row"]) < self._EX_MAX:
+                self._examples["bad_row"].append(row)
+            return None
+
+        fname = self._norm_fname(row[0])
+        label = self._norm_label(row[1])
+
+        if not fname:
+            self._reasons["empty_fname"] += 1
+            if len(self._examples["empty_fname"]) < self._EX_MAX:
+                self._examples["empty_fname"].append(row)
+            return None
+
+        if label == "":
+            self._reasons["empty_label"] += 1
+            if len(self._examples["empty_label"]) < self._EX_MAX:
+                self._examples["empty_label"].append(fname)
+            return None
+
+        if self._strict_charset:
+            missing = [c for c in label if c not in self.stoi]
+            if missing:
+                self._reasons["charset"] += 1
+                self._missing_chars.update(missing)
+                if len(self._examples["charset"]) < self._EX_MAX:
+                    uniq = "".join(sorted(set(missing)))[:20]
+                    self._examples["charset"].append((fname, label[:50], uniq))
+                return None
+
+        if self._strict_max_len and self._max_len is not None:
+            if self._effective_len(label) > self._max_len:
+                self._reasons["too_long"] += 1
+                if len(self._examples["too_long"]) < self._EX_MAX:
+                    self._examples["too_long"].append((fname, len(label), f"eff>{self._max_len}"))
+                return None
+
+        abs_path = self._resolve_path(fname)
+        if not abs_path or not os.path.exists(abs_path):
+            self._reasons["missing_path"] += 1
+            if len(self._examples["missing_path"]) < self._EX_MAX:
+                self._examples["missing_path"].append(fname)
+            return None
+
+        if self._validate_image:
+            try:
+                _ = imread_cv2(abs_path)
+            except Exception as e:
+                self._reasons["readfail"] += 1
+                if len(self._examples["readfail"]) < self._EX_MAX:
+                    self._examples["readfail"].append(f"{fname} :: {type(e).__name__}")
+                return None
+
+        return abs_path, label 
+
+    def _build_samples(self, rows: list[list[str]], num_workers: int):
+        if num_workers == -1:
+            workers = os.cpu_count() or 4
+        elif num_workers is None:
+            workers = 8
+        else:
+            workers = max(1, num_workers)
+
+        results, skipped = [], 0
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(self._validate_row, row) for row in self._rows]
+            for fut in tqdm(as_completed(futures), total=len(futures),
+                            desc="Проверка датасета", leave=False):
+                res = fut.result()
+                if res is not None:
+                    results.append(res)
+                else:
+                    skipped += 1
+        self.samples = results
+        self._skipped = skipped
+
+    def _print_summary(self, csv_path: str):
+        if self._skipped > 0:
+            print(f"[OCRDatasetAttn] {csv_path}: пропущено {self._skipped} записей.")
+            order = ["bad_row","empty_fname","empty_label","charset","too_long","missing_path","ambiguous","readfail"]
+            for k in order:
+                cnt = self._reasons[k]
+                if cnt > 0:
+                    print(f"  - {k}: {cnt}")
+                    ex = self._examples[k]
+                    if ex:
+                        print(f"    примеры: {ex[:self._EX_MAX]}")
+            if self._reasons["charset"] > 0 and self._missing_chars:
+                print("  Отсутствующие символы (TOP 30):")
+                for ch, cnt in self._missing_chars.most_common(30):
+                    print(f"    '{ch}' (U+{ord(ch):04X}, repr={repr(ch)}): {cnt} раз(а)")
 
 class ProportionalBatchSampler:
     def __init__(self, datasets, batch_size, proportions):

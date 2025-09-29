@@ -264,6 +264,8 @@ def run_training(cfg: Config, device: str = "cuda"):
                 img_max_width=img_w,
                 transform=train_transform,
                 encoding=encoding,
+                max_len=max_len,
+                strict_max_len=True
             )
             for c, r in zip(train_csvs, train_roots)
         ]
@@ -276,6 +278,8 @@ def run_training(cfg: Config, device: str = "cuda"):
                 img_max_width=img_w,
                 transform=val_transform,
                 encoding=encoding,
+                max_len=max_len,
+                strict_max_len=True
             )
             for c, r in zip(val_csvs, val_roots)
         ]
@@ -329,6 +333,31 @@ def run_training(cfg: Config, device: str = "cuda"):
         num_workers=num_workers,
         collate_fn=collate_val,
     )
+
+    # --- stats about dataset sizes ---
+    def _total_len(ds_list):
+        total = 0
+        for ds in ds_list:
+            try:
+                total += len(ds)   # работает и для Subset, и для обычных датасетов
+            except Exception:
+                pass
+        return total
+
+    n_train_samples = _total_len(train_sets)
+    n_val_samples   = _total_len(val_sets)
+
+    msg_ds = (
+        f"Datasets: train={n_train_samples} samples across {len(train_sets)} set(s); "
+        f"val={n_val_samples} samples across {len(val_sets)} set(s)"
+    )
+    msg_ld = (
+        f"Loaders: train_batches/epoch={len(train_loader)}; "
+        f"val_batches={len(val_loader)}; batch_size={batch_size}"
+    )
+
+    print(msg_ds);  logger.info(msg_ds)
+    print(msg_ld);  logger.info(msg_ld)
 
     # --- resume ---
     start_epoch = 1

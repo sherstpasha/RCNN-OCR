@@ -15,7 +15,7 @@
     "encoding": "utf-8",
     "img_h": 64,
     "img_w": 256,
-    "max_len": 40,
+    "max_len": 10,
     "hidden_size": 256,
     "batch_size": 64,
     "epochs": 100,
