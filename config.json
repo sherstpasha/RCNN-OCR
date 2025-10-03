@@ -15,7 +15,7 @@
     "encoding": "utf-8",
     "img_h": 64,
     "img_w": 256,
-    "max_len": 10,
+    "max_len": 40,
     "hidden_size": 256,
     "batch_size": 64,
     "epochs": 100,
@@ -38,7 +38,7 @@
     "val_size": 3000,
     "num_workers": 0,
     "save_every": 1,
-    "resume_path": null,
+    "resume_path": "exp2",
     "exp_dir": null,
     "seed": 42
 }

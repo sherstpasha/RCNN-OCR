@@ -2,6 +2,7 @@ import json
 import os
 import logging
 import csv
+from pathlib import Path
 
 import torch
 import torch.cuda.amp as amp
@@ -54,14 +55,21 @@ def setup_logger(exp_dir: str) -> logging.Logger:
 
 
 class Config:
+    _RESUME_CKPT_CANDIDATES = [
+        "last_ckpt.pth",
+        "best_loss_ckpt.pth",
+        "best_acc_ckpt.pth",
+    ]
+
     def __init__(self, path: str):
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            user_data = json.load(f)
 
-        for k, v in data.items():
+        merged = self._maybe_apply_resume(user_data)
+        for k, v in merged.items():
             setattr(self, k, v)
 
-        if not hasattr(self, "exp_dir") or self.exp_dir is None:
+        if not getattr(self, "exp_dir", None):
             exp_idx = 1
             while os.path.exists(f"exp{exp_idx}"):
                 exp_idx += 1
@@ -76,6 +84,55 @@ class Config:
 
     def __getitem__(self, key):
         return getattr(self, key)
+
+    def _maybe_apply_resume(self, user_data: dict) -> dict:
+        resume_path = user_data.get("resume_path")
+        if not resume_path:
+            return dict(user_data)
+
+        resume_path = Path(resume_path).expanduser().resolve()
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Путь для резюме не найден: {resume_path}")
+
+        resume_dir: Path
+        resume_ckpt: Path | None = None
+
+        if resume_path.is_dir():
+            resume_dir = resume_path
+            for name in self._RESUME_CKPT_CANDIDATES:
+                candidate = resume_dir / name
+                if candidate.is_file():
+                    resume_ckpt = candidate
+                    break
+            if resume_ckpt is None:
+                raise FileNotFoundError(
+                    f"В каталоге {resume_dir} не найдено чекпоинтов из списка {self._RESUME_CKPT_CANDIDATES}"
+                )
+        else:
+            resume_ckpt = resume_path
+            if not resume_ckpt.is_file():
+                raise FileNotFoundError(f"Чекпоинт для резюме не найден: {resume_ckpt}")
+            resume_dir = resume_ckpt.parent
+
+        resume_config_path = resume_dir / "config.json"
+        resume_config = {}
+        if resume_config_path.is_file():
+            try:
+                with open(resume_config_path, "r", encoding="utf-8") as f:
+                    resume_config = json.load(f)
+            except Exception as e:
+                print(f"[Config] Не удалось прочитать конфиг эксперимента {resume_config_path}: {e}")
+        else:
+            print(f"[Config] В каталоге резюме нет config.json, используется текущий конфиг")
+
+        merged = dict(resume_config)
+        for key, value in user_data.items():
+            if value is not None:
+                merged[key] = value
+
+        merged["resume_path"] = str(resume_ckpt)
+        merged["exp_dir"] = str(resume_dir)
+        return merged
 
 
 def split_train_val(

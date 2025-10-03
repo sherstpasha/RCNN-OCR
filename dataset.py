@@ -216,7 +216,16 @@ class OCRDatasetAttn(Dataset):
         rows = self._read_rows(csv_path)
         self._maybe_detect_header(rows)
         self._build_samples(rows, num_workers)
+
+        self._invalid_mask = [False] * len(self.samples)
+        self._checked_mask = [not self._validate_image] * len(self.samples)
+        self._lazy_warned = False
+        self._lazy_skipped = 0
+        self._max_getitem_retries = 8
+
         self._print_summary(csv_path)
+        if self._validate_image:
+            print("[OCRDatasetAttn] Lazy image validation is enabled; unreadable images will be skipped during the first access.")
 
         if not self.samples:
             raise RuntimeError(f"В датасете {csv_path} не осталось валидных примеров!")
@@ -225,18 +234,66 @@ class OCRDatasetAttn(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        abs_path, label = self.samples[idx]
-        try:
-            img = imread_cv2(abs_path)
-        except Exception as e:
-            raise IndexError(f"Ошибка чтения изображения {abs_path}: {e}")
+        if not (0 <= idx < len(self.samples)):
+            raise IndexError(idx)
 
-        if self.transform:
-            augmented = self.transform(image=img)
-            tensor = augmented["image"]
-        else:
-            tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
-        return tensor, label
+        if not self._validate_image:
+            abs_path, label = self.samples[idx]
+            try:
+                img = imread_cv2(abs_path)
+            except Exception as e:
+                raise IndexError(f"Ошибка чтения изображения {abs_path}: {e}") from e
+
+            if self.transform:
+                augmented = self.transform(image=img)
+                tensor = augmented["image"]
+            else:
+                tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+            return tensor, label
+
+        attempts = self._max_getitem_retries
+        current_idx = idx
+        while attempts > 0:
+            abs_path, label = self.samples[current_idx]
+
+            if self._invalid_mask[current_idx]:
+                current_idx = self._choose_alternative_index(current_idx)
+                attempts -= 1
+                continue
+
+            try:
+                img = imread_cv2(abs_path)
+                self._checked_mask[current_idx] = True
+            except Exception as e:
+                self._mark_sample_invalid(current_idx, abs_path, e)
+                current_idx = self._choose_alternative_index(current_idx)
+                attempts -= 1
+                continue
+
+            if self.transform:
+                augmented = self.transform(image=img)
+                tensor = augmented["image"]
+            else:
+                tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+            return tensor, label
+
+        raise RuntimeError("Failed to fetch a valid sample after lazy validation retries.")
+
+    def _mark_sample_invalid(self, idx: int, abs_path: str, error: Exception):
+        self._invalid_mask[idx] = True
+        self._reasons["readfail"] += 1
+        if len(self._examples["readfail"]) < self._EX_MAX:
+            self._examples["readfail"].append(f"{abs_path} :: {type(error).__name__}")
+        self._lazy_skipped += 1
+        if not self._lazy_warned:
+            print("[OCRDatasetAttn] Lazy validation detected unreadable images; they will be skipped during iteration.")
+            self._lazy_warned = True
+
+    def _choose_alternative_index(self, bad_idx: int) -> int:
+        candidates = [i for i, invalid in enumerate(self._invalid_mask) if not invalid and i != bad_idx]
+        if candidates:
+            return random.choice(candidates)
+        raise RuntimeError("No valid samples remain after filtering unreadable images.")
 
     @staticmethod
     def make_collate_attn(stoi, max_len: int, drop_blank: bool = True):
@@ -351,16 +408,7 @@ class OCRDatasetAttn(Dataset):
                 self._examples["missing_path"].append(fname)
             return None
 
-        if self._validate_image:
-            try:
-                _ = imread_cv2(abs_path)
-            except Exception as e:
-                self._reasons["readfail"] += 1
-                if len(self._examples["readfail"]) < self._EX_MAX:
-                    self._examples["readfail"].append(f"{fname} :: {type(e).__name__}")
-                return None
-
-        return abs_path, label 
+        return abs_path, label
 
     def _build_samples(self, rows: list[list[str]], num_workers: int):
         if num_workers == -1:
