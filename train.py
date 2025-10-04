@@ -221,7 +221,13 @@ def run_training(cfg: Config, device: str = "cuda"):
 
     # прочее
     resume_path = getattr(cfg, "resume_path", None)
-    save_every = getattr(cfg, "save_every", 1)
+    eval_every = getattr(cfg, "eval_every", getattr(cfg, "save_every", 1))
+    try:
+        eval_every = int(eval_every)
+    except (TypeError, ValueError):
+        raise ValueError("eval_every must be a positive integer")
+    if eval_every < 1:
+        raise ValueError("eval_every must be >= 1")
     train_proportions = getattr(cfg, "train_proportions", None)
     val_size = getattr(cfg, "val_size", 3000)
     num_workers = getattr(cfg, "num_workers", 0)
@@ -468,87 +474,115 @@ def run_training(cfg: Config, device: str = "cuda"):
 
         avg_train_loss = total_train_loss / max(1, len(train_loader))
 
-        # validate
-        model.eval()
-        total_val_loss = 0.0
-        refs, hyps = [], []
-        pbar_val = tqdm(val_loader, desc=f"Valid {epoch}/{epochs}", leave=False)
-        with torch.no_grad():
-            for imgs, text_in, target_y, lengths in pbar_val:
-                imgs = imgs.to(device)
-                text_in = text_in.to(device)
-                target_y = target_y.to(device)
+        should_eval = ((epoch - start_epoch) % eval_every == 0) or (epoch == epochs)
 
-                with amp.autocast():
-                    logits_tf = model(
-                        imgs, text=text_in, is_train=True, batch_max_length=max_len
-                    )
-                    val_loss = criterion(
-                        logits_tf.reshape(-1, logits_tf.size(-1)), target_y.reshape(-1)
-                    )
-                total_val_loss += float(val_loss.item())
+        avg_val_loss = None
+        val_acc = None
+        val_cer = None
+        val_wer = None
 
-                logits = model(
-                    imgs, is_train=False, batch_max_length=max_len
-                )  # [B,T,V]
-                pred_ids = logits.argmax(-1).cpu()
-                tgt_ids = target_y.cpu()
-
-                for p_row, t_row in zip(pred_ids, tgt_ids):
-                    hyp = decode_tokens(
-                        p_row, itos, pad_id=PAD, eos_id=EOS, blank_id=BLANK
-                    )
-                    ref = decode_tokens(
-                        t_row, itos, pad_id=PAD, eos_id=EOS, blank_id=BLANK
-                    )
-                    hyps.append(hyp)
-                    refs.append(ref)
-
-                pbar_val.set_postfix(val_loss=f"{float(val_loss.item()):.4f}")
-
-        avg_val_loss = total_val_loss / max(1, len(val_loader))
-        val_acc = compute_accuracy(refs, hyps)
-        val_cer = sum(character_error_rate(r, h) for r, h in zip(refs, hyps)) / max(
-            1, len(refs)
-        )
-        val_wer = sum(word_error_rate(r, h) for r, h in zip(refs, hyps)) / max(
-            1, len(refs)
-        )
-
-        # TensorBoard
         writer.add_scalar("Loss/train_epoch", avg_train_loss, epoch)
-        writer.add_scalar("Loss/val_epoch", avg_val_loss, epoch)
-        writer.add_scalar("Accuracy/val", val_acc, epoch)
-        writer.add_scalar("CER/val", val_cer, epoch)
-        writer.add_scalar("WER/val", val_wer, epoch)
 
-        # CSV лог
-        with open(metrics_csv_path, "a", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(
-                [
-                    epoch,
-                    f"{avg_train_loss:.6f}",
-                    f"{avg_val_loss:.6f}",
-                    f"{val_acc:.6f}",
-                    f"{val_cer:.6f}",
-                    f"{val_wer:.6f}",
-                    f"{optimizer.param_groups[0]['lr']:.6e}",
-                ]
+        if should_eval:
+            model.eval()
+            total_val_loss = 0.0
+            refs, hyps = [], []
+            pbar_val = tqdm(val_loader, desc=f"Valid {epoch}/{epochs}", leave=False)
+            with torch.no_grad():
+                for imgs, text_in, target_y, lengths in pbar_val:
+                    imgs = imgs.to(device)
+                    text_in = text_in.to(device)
+                    target_y = target_y.to(device)
+
+                    with amp.autocast():
+                        logits_tf = model(
+                            imgs, text=text_in, is_train=True, batch_max_length=max_len
+                        )
+                        val_loss = criterion(
+                            logits_tf.reshape(-1, logits_tf.size(-1)), target_y.reshape(-1)
+                        )
+                    total_val_loss += float(val_loss.item())
+
+                    logits = model(
+                        imgs, is_train=False, batch_max_length=max_len
+                    )
+                    pred_ids = logits.argmax(-1).cpu()
+                    tgt_ids = target_y.cpu()
+
+                    for p_row, t_row in zip(pred_ids, tgt_ids):
+                        hyp = decode_tokens(
+                            p_row, itos, pad_id=PAD, eos_id=EOS, blank_id=BLANK
+                        )
+                        ref = decode_tokens(
+                            t_row, itos, pad_id=PAD, eos_id=EOS, blank_id=BLANK
+                        )
+                        hyps.append(hyp)
+                        refs.append(ref)
+
+                    pbar_val.set_postfix(val_loss=f"{float(val_loss.item()):.4f}")
+
+            avg_val_loss = total_val_loss / max(1, len(val_loader))
+            val_acc = compute_accuracy(refs, hyps)
+            val_cer = sum(character_error_rate(r, h) for r, h in zip(refs, hyps)) / max(1, len(refs))
+            val_wer = sum(word_error_rate(r, h) for r, h in zip(refs, hyps)) / max(1, len(refs))
+
+            writer.add_scalar("Loss/val_epoch", avg_val_loss, epoch)
+            writer.add_scalar("Accuracy/val", val_acc, epoch)
+            writer.add_scalar("CER/val", val_cer, epoch)
+            writer.add_scalar("WER/val", val_wer, epoch)
+        else:
+            logger.info(
+                f"Epoch {epoch:03d}: skipping validation (eval_every={eval_every})"
             )
 
-        # печать/лог
-        msg = (
-            f"Epoch {epoch:03d}/{epochs} | "
-            f"train_loss={avg_train_loss:.4f} | val_loss={avg_val_loss:.4f} | "
-            f"acc={val_acc:.4f} | CER={val_cer:.4f} | WER={val_wer:.4f} | "
-            f"lr={optimizer.param_groups[0]['lr']:.2e}"
-        )
+        with open(metrics_csv_path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if should_eval:
+                w.writerow(
+                    [
+                        epoch,
+                        f"{avg_train_loss:.6f}",
+                        f"{avg_val_loss:.6f}",
+                        f"{val_acc:.6f}",
+                        f"{val_cer:.6f}",
+                        f"{val_wer:.6f}",
+                        f"{optimizer.param_groups[0]['lr']:.6e}",
+                    ]
+                )
+            else:
+                w.writerow(
+                    [
+                        epoch,
+                        f"{avg_train_loss:.6f}",
+                        "skipped",
+                        "skipped",
+                        "skipped",
+                        "skipped",
+                        f"{optimizer.param_groups[0]['lr']:.6e}",
+                    ]
+                )
+
+        msg_parts = [
+            f"Epoch {epoch:03d}/{epochs}",
+            f"train_loss={avg_train_loss:.4f}",
+        ]
+        if should_eval:
+            msg_parts.extend(
+                [
+                    f"val_loss={avg_val_loss:.4f}",
+                    f"acc={val_acc:.4f}",
+                    f"CER={val_cer:.4f}",
+                    f"WER={val_wer:.4f}",
+                ]
+            )
+        else:
+            msg_parts.append(f"val=skipped (eval_every={eval_every})")
+        msg_parts.append(f"lr={optimizer.param_groups[0]['lr']:.2e}")
+        msg = " | ".join(msg_parts)
         print(msg)
         logger.info(msg)
 
-        # save "last"
-        if (epoch % save_every) == 0:
+        if should_eval:
             save_checkpoint(
                 last_path,
                 model,
@@ -583,85 +617,84 @@ def run_training(cfg: Config, device: str = "cuda"):
             )
             save_weights(last_weights_path, model)
 
-        # track bests
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            save_checkpoint(
-                best_loss_path,
-                model,
-                optimizer,
-                scheduler,
-                scaler,
-                epoch,
-                global_step,
-                best_val_loss,
-                val_acc,
-                itos,
-                stoi,
-                {
-                    "batch_size": batch_size,
-                    "epochs": epochs,
-                    "lr": lr,
-                    "optimizer": optimizer_name,
-                    "scheduler": scheduler_name,
-                    "weight_decay": weight_decay,
-                    "momentum": momentum,
-                    "img_h": img_h,
-                    "img_w": img_w,
-                    "encoding": encoding,
-                    "max_len": max_len,
-                    "charset_path": charset_path,
-                    "train_csvs": train_csvs,
-                    "train_roots": train_roots,
-                    "val_csvs": val_csvs,
-                    "val_roots": val_roots,
-                },
-                log_dir,
-            )
-            save_weights(best_loss_weights_path, model)
-            logger.info(f"New best val_loss: {best_val_loss:.4f} (epoch {epoch})")
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                save_checkpoint(
+                    best_loss_path,
+                    model,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    epoch,
+                    global_step,
+                    best_val_loss,
+                    val_acc,
+                    itos,
+                    stoi,
+                    {
+                        "batch_size": batch_size,
+                        "epochs": epochs,
+                        "lr": lr,
+                        "optimizer": optimizer_name,
+                        "scheduler": scheduler_name,
+                        "weight_decay": weight_decay,
+                        "momentum": momentum,
+                        "img_h": img_h,
+                        "img_w": img_w,
+                        "encoding": encoding,
+                        "max_len": max_len,
+                        "charset_path": charset_path,
+                        "train_csvs": train_csvs,
+                        "train_roots": train_roots,
+                        "val_csvs": val_csvs,
+                        "val_roots": val_roots,
+                    },
+                    log_dir,
+                )
+                save_weights(best_loss_weights_path, model)
+                logger.info(f"New best val_loss: {best_val_loss:.4f} (epoch {epoch})")
 
-        if val_acc >= best_val_acc:
-            best_val_acc = val_acc
-            save_checkpoint(
-                best_acc_path,
-                model,
-                optimizer,
-                scheduler,
-                scaler,
-                epoch,
-                global_step,
-                best_val_loss,
-                best_val_acc,
-                itos,
-                stoi,
-                {
-                    "batch_size": batch_size,
-                    "epochs": epochs,
-                    "lr": lr,
-                    "optimizer": optimizer_name,
-                    "scheduler": scheduler_name,
-                    "weight_decay": weight_decay,
-                    "momentum": momentum,
-                    "img_h": img_h,
-                    "img_w": img_w,
-                    "encoding": encoding,
-                    "max_len": max_len,
-                    "charset_path": charset_path,
-                    "train_csvs": train_csvs,
-                    "train_roots": train_roots,
-                    "val_csvs": val_csvs,
-                    "val_roots": val_roots,
-                },
-                log_dir,
-            )
-            save_weights(best_acc_weights_path, model)
-            logger.info(f"New best acc: {best_val_acc:.4f} (epoch {epoch})")
+            if val_acc >= best_val_acc:
+                best_val_acc = val_acc
+                save_checkpoint(
+                    best_acc_path,
+                    model,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    epoch,
+                    global_step,
+                    best_val_loss,
+                    best_val_acc,
+                    itos,
+                    stoi,
+                    {
+                        "batch_size": batch_size,
+                        "epochs": epochs,
+                        "lr": lr,
+                        "optimizer": optimizer_name,
+                        "scheduler": scheduler_name,
+                        "weight_decay": weight_decay,
+                        "momentum": momentum,
+                        "img_h": img_h,
+                        "img_w": img_w,
+                        "encoding": encoding,
+                        "max_len": max_len,
+                        "charset_path": charset_path,
+                        "train_csvs": train_csvs,
+                        "train_roots": train_roots,
+                        "val_csvs": val_csvs,
+                        "val_roots": val_roots,
+                    },
+                    log_dir,
+                )
+                save_weights(best_acc_weights_path, model)
+                logger.info(f"New best acc: {best_val_acc:.4f} (epoch {epoch})")
 
-        # scheduler step
         if scheduler is not None:
             if isinstance(scheduler, ReduceLROnPlateau):
-                scheduler.step(avg_val_loss)
+                if should_eval and avg_val_loss is not None:
+                    scheduler.step(avg_val_loss)
             else:
                 scheduler.step()
 

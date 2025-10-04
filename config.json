@@ -37,8 +37,8 @@
     ],
     "val_size": 3000,
     "num_workers": 0,
-    "save_every": 1,
     "resume_path": "exp2",
     "exp_dir": null,
-    "seed": 42
+    "seed": 42,
+    "eval_every": 1
 }
