@@ -173,7 +173,7 @@ class RCNN(nn.Module):
         pad_id: int = 0,
         blank_id: int | None = 3,
         enc_dropout_p: float = 0.1,
-        dropblock_p: float = 0.1,
+        dropblock_p: float = 0.0,
         dropblock_block_size: int = 5,
     ):
         super().__init__()

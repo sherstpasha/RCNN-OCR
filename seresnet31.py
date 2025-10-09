@@ -73,7 +73,7 @@ class SEResNet31(nn.Module):
         in_channels=3,
         out_channels=512,
         reduction=16,
-        dropblock_p=0.1,
+        dropblock_p=0.0,
         dropblock_block_size=5,
     ):
         super().__init__()
