@@ -389,13 +389,16 @@ def run_training(cfg: Config, device: str = "cuda"):
             collate_fn=collate_train,
         )
 
-    val_loader = DataLoader(
-        ConcatDataset(val_sets),
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collate_val,
-    )
+    val_loaders_individual = [
+        DataLoader(
+            val_set,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate_val,
+        )
+        for val_set in val_sets
+    ]
 
     # --- stats about dataset sizes ---
     def _total_len(ds_list):
@@ -414,9 +417,10 @@ def run_training(cfg: Config, device: str = "cuda"):
         f"Datasets: train={n_train_samples} samples across {len(train_sets)} set(s); "
         f"val={n_val_samples} samples across {len(val_sets)} set(s)"
     )
+    total_val_batches = sum(len(loader) for loader in val_loaders_individual)
     msg_ld = (
         f"Loaders: train_batches/epoch={len(train_loader)}; "
-        f"val_batches={len(val_loader)}; batch_size={batch_size}"
+        f"val_batches={total_val_batches}; batch_size={batch_size}"
     )
 
     print(msg_ds);  logger.info(msg_ds)
@@ -485,46 +489,80 @@ def run_training(cfg: Config, device: str = "cuda"):
 
         if should_eval:
             model.eval()
+            torch.cuda.empty_cache()
+            
             total_val_loss = 0.0
-            refs, hyps = [], []
-            pbar_val = tqdm(val_loader, desc=f"Valid {epoch}/{epochs}", leave=False)
-            with torch.no_grad():
-                for imgs, text_in, target_y, lengths in pbar_val:
-                    imgs = imgs.to(device)
-                    text_in = text_in.to(device)
-                    target_y = target_y.to(device)
+            total_samples = 0
+            total_correct = 0
+            total_chars = 0
+            total_cer_sum = 0.0
+            total_wer_sum = 0.0
+            total_predictions = 0
+            
+            for i, val_loader_single in enumerate(val_loaders_individual):
+                total_val_loss_single = 0.0
+                refs_single, hyps_single = [], []
+                pbar_val = tqdm(val_loader_single, desc=f"Valid Set {i} {epoch}/{epochs}", leave=False)
+                with torch.no_grad():
+                    for imgs, text_in, target_y, lengths in pbar_val:
+                        imgs = imgs.to(device)
+                        text_in = text_in.to(device)
+                        target_y = target_y.to(device)
 
-                    with amp.autocast():
-                        logits_tf = model(
-                            imgs, text=text_in, is_train=True, batch_max_length=max_len
+                        with amp.autocast():
+                            logits_tf = model(
+                                imgs, text=text_in, is_train=True, batch_max_length=max_len
+                            )
+                            val_loss = criterion(
+                                logits_tf.reshape(-1, logits_tf.size(-1)), target_y.reshape(-1)
+                            )
+                        total_val_loss_single += float(val_loss.item())
+
+                        logits = model(
+                            imgs, is_train=False, batch_max_length=max_len
                         )
-                        val_loss = criterion(
-                            logits_tf.reshape(-1, logits_tf.size(-1)), target_y.reshape(-1)
-                        )
-                    total_val_loss += float(val_loss.item())
+                        pred_ids = logits.argmax(-1).cpu()
+                        tgt_ids = target_y.cpu()
 
-                    logits = model(
-                        imgs, is_train=False, batch_max_length=max_len
-                    )
-                    pred_ids = logits.argmax(-1).cpu()
-                    tgt_ids = target_y.cpu()
+                        for p_row, t_row in zip(pred_ids, tgt_ids):
+                            hyp = decode_tokens(
+                                p_row, itos, pad_id=PAD, eos_id=EOS, blank_id=BLANK
+                            )
+                            ref = decode_tokens(
+                                t_row, itos, pad_id=PAD, eos_id=EOS, blank_id=BLANK
+                            )
+                            hyps_single.append(hyp)
+                            refs_single.append(ref)
 
-                    for p_row, t_row in zip(pred_ids, tgt_ids):
-                        hyp = decode_tokens(
-                            p_row, itos, pad_id=PAD, eos_id=EOS, blank_id=BLANK
-                        )
-                        ref = decode_tokens(
-                            t_row, itos, pad_id=PAD, eos_id=EOS, blank_id=BLANK
-                        )
-                        hyps.append(hyp)
-                        refs.append(ref)
+                        pbar_val.set_postfix(val_loss=f"{float(val_loss.item()):.4f}")
+                        del imgs, text_in, target_y, logits_tf, logits, pred_ids, tgt_ids
 
-                    pbar_val.set_postfix(val_loss=f"{float(val_loss.item()):.4f}")
+                avg_val_loss_single = total_val_loss_single / max(1, len(val_loader_single))
+                val_acc_single = compute_accuracy(refs_single, hyps_single)
+                val_cer_single = sum(character_error_rate(r, h) for r, h in zip(refs_single, hyps_single)) / max(1, len(refs_single))
+                val_wer_single = sum(word_error_rate(r, h) for r, h in zip(refs_single, hyps_single)) / max(1, len(refs_single))
 
-            avg_val_loss = total_val_loss / max(1, len(val_loader))
-            val_acc = compute_accuracy(refs, hyps)
-            val_cer = sum(character_error_rate(r, h) for r, h in zip(refs, hyps)) / max(1, len(refs))
-            val_wer = sum(word_error_rate(r, h) for r, h in zip(refs, hyps)) / max(1, len(refs))
+                writer.add_scalar(f"Loss/val_set_{i}", avg_val_loss_single, epoch)
+                writer.add_scalar(f"Accuracy/val_set_{i}", val_acc_single, epoch)
+                writer.add_scalar(f"CER/val_set_{i}", val_cer_single, epoch)
+                writer.add_scalar(f"WER/val_set_{i}", val_wer_single, epoch)
+                
+                total_val_loss += total_val_loss_single
+                total_samples += len(val_loader_single)
+                
+                correct_single = sum(1 for r, h in zip(refs_single, hyps_single) if r == h)
+                total_correct += correct_single
+                total_predictions += len(refs_single)
+                total_cer_sum += sum(character_error_rate(r, h) for r, h in zip(refs_single, hyps_single))
+                total_wer_sum += sum(word_error_rate(r, h) for r, h in zip(refs_single, hyps_single))
+                
+                del refs_single, hyps_single
+                torch.cuda.empty_cache()
+
+            avg_val_loss = total_val_loss / max(1, total_samples)
+            val_acc = total_correct / max(1, total_predictions)
+            val_cer = total_cer_sum / max(1, total_predictions)
+            val_wer = total_wer_sum / max(1, total_predictions)
 
             writer.add_scalar("Loss/val_epoch", avg_val_loss, epoch)
             writer.add_scalar("Accuracy/val", val_acc, epoch)

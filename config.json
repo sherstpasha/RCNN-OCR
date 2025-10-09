@@ -1,24 +1,28 @@
 {
     "train_csvs": [
-        "C:/shared/orig_cyrillic/train.tsv"
+        "C:\\Users\\USER\\Desktop\\archive_25_09\\dataset\\handwritten\\train\\labels.csv",
+        "C:\\Users\\USER\\Desktop\\archive_25_09\\dataset\\printed\\train\\labels.csv"
     ],
     "train_roots": [
-        "C:/shared/orig_cyrillic/train"
+        "C:\\Users\\USER\\Desktop\\archive_25_09\\dataset\\handwritten\\train",
+        "C:\\Users\\USER\\Desktop\\archive_25_09\\dataset\\printed\\train"
     ],
     "val_csvs": [
-        "C:/shared/orig_cyrillic/test.tsv"
+        "C:\\Users\\USER\\Desktop\\archive_25_09\\dataset\\handwritten\\val\\labels.csv",
+        "C:\\Users\\USER\\Desktop\\archive_25_09\\dataset\\printed\\val\\labels.csv"
     ],
     "val_roots": [
-        "C:/shared/orig_cyrillic/test"
+        "C:\\Users\\USER\\Desktop\\archive_25_09\\dataset\\handwritten\\val",
+        "C:\\Users\\USER\\Desktop\\archive_25_09\\dataset\\printed\\val"
     ],
     "charset_path": "charset.txt",
     "encoding": "utf-8",
-    "img_h": 64,
-    "img_w": 256,
+    "img_h": 16,
+    "img_w": 64,
     "max_len": 40,
     "hidden_size": 256,
-    "batch_size": 64,
-    "epochs": 100,
+    "batch_size": 1024,
+    "epochs": 1000,
     "lr": 0.000510753964866869,
     "optimizer": "Adam",
     "scheduler": "CosineAnnealingLR",
@@ -33,12 +37,13 @@
     "p_BrightnessContrast": 0.09102159869005591,
     "invert_p": 0.01,
     "train_proportions": [
-        1.0
+        0.5,
+        0.5
     ],
-    "val_size": 3000,
+    "val_size": null,
     "num_workers": 0,
-    "resume_path": "exp2",
+    "resume_path": null,
     "exp_dir": null,
     "seed": 42,
-    "eval_every": 1
+    "eval_every": 10
 }
