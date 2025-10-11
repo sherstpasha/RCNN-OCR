@@ -21,7 +21,7 @@
     "img_w": 128,
     "max_len": 40,
     "hidden_size": 256,
-    "batch_size": 512,
+    "batch_size": 128,
     "epochs": 1000,
     "lr": 0.000510753964866869,
     "optimizer": "Adam",
@@ -43,7 +43,7 @@
     "val_size": null,
     "num_workers": 0,
     "resume_path": null,
-    "exp_dir": null,
+    "exp_dir": "exp1",
     "seed": 42,
     "eval_every": 10
 }
