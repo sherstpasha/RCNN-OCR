@@ -13,18 +13,20 @@ from torch.utils.data import ConcatDataset, DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from dataset import (
+from data.dataset import (
     OCRDatasetAttn,
     MultiDataset,
     ProportionalBatchSampler,
+)
+from data.transforms import (
     decode_tokens,
     get_train_transform,
     get_val_transform,
     load_charset,
 )
-from metrics import character_error_rate, compute_accuracy, word_error_rate
-from model import RCNN
-from utils import load_checkpoint, save_checkpoint, save_weights, set_seed
+from training.metrics import character_error_rate, compute_accuracy, word_error_rate
+from model.model import RCNN
+from training.utils import load_checkpoint, save_checkpoint, save_weights, set_seed
 
 
 # -------------------------
@@ -317,35 +319,64 @@ def run_training(cfg: Config, device: str = "cuda"):
     val_transform = get_val_transform(img_h, img_w)
 
     # --- датасеты и лоадеры ---
+    train_sets = []
+    val_sets = []
+    
     if val_csvs and val_roots:
-        train_sets = [
-            OCRDatasetAttn(
-                c,
-                r,
-                stoi,
-                img_height=img_h,
-                img_max_width=img_w,
-                transform=train_transform,
-                encoding=encoding,
-                max_len=max_len,
-                strict_max_len=True
-            )
-            for c, r in zip(train_csvs, train_roots)
-        ]
-        val_sets = [
-            OCRDatasetAttn(
-                c,
-                r,
-                stoi,
-                img_height=img_h,
-                img_max_width=img_w,
-                transform=val_transform,
-                encoding=encoding,
-                max_len=max_len,
-                strict_max_len=True
-            )
-            for c, r in zip(val_csvs, val_roots)
-        ]
+        for i, (train_csv, train_root) in enumerate(zip(train_csvs, train_roots)):
+            has_separate_val = (i < len(val_csvs) and i < len(val_roots) and 
+                              val_csvs[i] is not None and val_roots[i] is not None)
+            
+            if has_separate_val:
+                train_ds = OCRDatasetAttn(
+                    train_csv,
+                    train_root,
+                    stoi,
+                    img_height=img_h,
+                    img_max_width=img_w,
+                    transform=train_transform,
+                    encoding=encoding,
+                    max_len=max_len,
+                    strict_max_len=True
+                )
+                val_ds = OCRDatasetAttn(
+                    val_csvs[i],
+                    val_roots[i],
+                    stoi,
+                    img_height=img_h,
+                    img_max_width=img_w,
+                    transform=val_transform,
+                    encoding=encoding,
+                    max_len=max_len,
+                    strict_max_len=True
+                )
+                train_sets.append(train_ds)
+                val_sets.append(val_ds)
+            else:
+                full_ds = OCRDatasetAttn(
+                    train_csv,
+                    train_root,
+                    stoi,
+                    img_height=img_h,
+                    img_max_width=img_w,
+                    transform=None,
+                    encoding=encoding,
+                    max_len=max_len,
+                    strict_max_len=True
+                )
+                n_val = min(val_size if val_size else 3000, len(full_ds))
+                n_train = len(full_ds) - n_val
+                if n_train <= 0:
+                    raise ValueError(
+                        f"В датасете {train_csv} всего {len(full_ds)} примеров, меньше чем {n_val}"
+                    )
+                
+                train_ds, val_ds = random_split(full_ds, [n_train, n_val])
+                train_ds.dataset.transform = train_transform
+                val_ds.dataset.transform = val_transform
+                
+                train_sets.append(train_ds)
+                val_sets.append(val_ds)
     else:
         train_sets, val_sets = split_train_val(
             train_csvs,
@@ -405,13 +436,23 @@ def run_training(cfg: Config, device: str = "cuda"):
         total = 0
         for ds in ds_list:
             try:
-                total += len(ds)   # работает и для Subset, и для обычных датасетов
+                total += len(ds)
             except Exception:
                 pass
         return total
 
     n_train_samples = _total_len(train_sets)
     n_val_samples   = _total_len(val_sets)
+    
+    # Логгирование информации о валидационной стратегии
+    logger.info(f"Validation strategy:")
+    for i, (train_csv, train_root) in enumerate(zip(train_csvs, train_roots)):
+        has_separate_val = (val_csvs and val_roots and i < len(val_csvs) and i < len(val_roots) and 
+                          val_csvs[i] is not None and val_roots[i] is not None)
+        if has_separate_val:
+            logger.info(f"  Dataset {i}: using separate validation set from {val_roots[i]}")
+        else:
+            logger.info(f"  Dataset {i}: using split from training set (val_size={val_size})")
 
     msg_ds = (
         f"Datasets: train={n_train_samples} samples across {len(train_sets)} set(s); "

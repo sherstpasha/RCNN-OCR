@@ -1,5 +1,5 @@
-from train import Config, run_training
+from training.train import Config, run_training
 
 
-cfg = Config("config.json")
+cfg = Config("configs/config.json")
 run_training(cfg, device="cuda")

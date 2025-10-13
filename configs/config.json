@@ -8,14 +8,14 @@
         "C:\\Users\\USER\\Desktop\\archive_25_09\\dataset\\printed\\train"
     ],
     "val_csvs": [
-        "C:\\Users\\USER\\Desktop\\archive_25_09\\dataset\\handwritten\\val\\labels.csv",
+        null,
         "C:\\Users\\USER\\Desktop\\archive_25_09\\dataset\\printed\\val\\labels.csv"
     ],
     "val_roots": [
-        "C:\\Users\\USER\\Desktop\\archive_25_09\\dataset\\handwritten\\val",
+        null,
         "C:\\Users\\USER\\Desktop\\archive_25_09\\dataset\\printed\\val"
     ],
-    "charset_path": "charset.txt",
+    "charset_path": "configs/charset.txt",
     "encoding": "utf-8",
     "img_h": 32,
     "img_w": 128,
@@ -40,7 +40,7 @@
         0.5,
         0.5
     ],
-    "val_size": null,
+    "val_size": 1000,
     "num_workers": 0,
     "resume_path": null,
     "exp_dir": "exp1",

@@ -3,11 +3,8 @@ from torch.utils.data import DataLoader
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-from dataset import (
-    OCRDatasetAttn,
-    load_charset,
-    ResizeAndPadA,
-)
+from data.dataset import OCRDatasetAttn
+from data.transforms import load_charset, ResizeAndPadA
 
 # --- пути ---
 train_csv = r"C:\shared\orig_cyrillic\train.tsv"
